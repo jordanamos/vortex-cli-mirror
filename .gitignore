@@ -1,0 +1,13 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+.DS_Store
+
+# Unit test / coverage reports
+.pytest_cache/
+.mypy_cache/
+.tox/
+.coverage
+
+# packaging
+build/
+*.egg-info/
