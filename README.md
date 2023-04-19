@@ -9,7 +9,7 @@ Vortex CLI also comes pre-packaged with the necessary Puakma .jar files for deve
 1. Install the tool using pip.
 
    ```
-   pip install git+https://github.com/jordanamos/vortex-cli.git
+   pip install git+https://github.com/jordanamos/vortex-cli-mirror.git
    ```
 
 2. It is recommended to set the workspace you would like to work out of via the `VORTEX_WORKSPACE` environment variable.
