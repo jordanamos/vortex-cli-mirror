@@ -122,17 +122,6 @@ class Workspace:
         with file_lock(self.path / ".lock", _blocked_cb):
             yield
 
-    def apps(self) -> list[PuakmaApplication]:
-        """Returns a list of locally cloned puakma applications"""
-        ret = []
-        for sub_dir in self.path.iterdir():
-            if sub_dir.is_dir():
-                try:
-                    ret.append(PuakmaApplication.from_dir(sub_dir))
-                except ValueError:
-                    continue
-        return ret
-
     def mkdir(self, app: PuakmaApplication) -> Path:
         """
         Creates a .PuakmaApplication.pickle file within a newly created app directory
@@ -147,20 +136,27 @@ class Workspace:
             pickle.dump(app, f)
         return app_path
 
-    def listdir(self) -> list[Path]:
+    def listdir(self, strict: bool = True) -> list[Path]:
         """
         Returns a list of directories that contain a parseable
-        .PuakmaApplication.pickle file
-        """
+        .PuakmaApplication.pickle file.
 
+        If strict is False then return directories that simply
+        contain a .PuakmaApplication.pickle file.
+        """
         ret = []
         for sub_dir in self.path.iterdir():
             if sub_dir.is_dir():
-                try:
-                    PuakmaApplication.from_dir(sub_dir)
-                    ret.append(sub_dir)
-                except ValueError:
-                    continue
+                if strict:
+                    try:
+                        PuakmaApplication.from_dir(sub_dir)
+                    except ValueError:
+                        continue
+                else:
+                    pickle_file = sub_dir / PuakmaApplication.PICKLE_FILE
+                    if not pickle_file.exists():
+                        continue
+                ret.append(sub_dir)
         return ret
 
     def read_server_from_config(self, server_name: str | None = None) -> PuakmaServer:
@@ -185,6 +181,7 @@ class Workspace:
             puakma_db_conn_id = config.getint(server_name, "puakma_db_conn_id")
             username = config.get(server_name, "username", fallback=None)
             password = config.get(server_name, "password", fallback=None)
+
             if not host:
                 raise ValueError(f"Empty 'host' value for server '{server_name}'")
             if not soap_path:

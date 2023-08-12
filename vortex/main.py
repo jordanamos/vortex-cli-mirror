@@ -9,12 +9,16 @@ import functools
 import logging
 import os
 import shutil
+import textwrap
 import webbrowser
 import xml.etree.ElementTree as ET
 import zlib
 from collections.abc import Generator
 from collections.abc import Sequence
+from datetime import datetime
+from pathlib import Path
 
+from httpx import HTTPStatusError
 from watchfiles import awatch
 from watchfiles import BaseFilter
 from watchfiles import Change
@@ -26,10 +30,6 @@ from vortex.models import InvalidDesignPathError
 from vortex.models import JavaClassVersion
 from vortex.models import PuakmaApplication
 from vortex.models import PuakmaServer
-from vortex.soap import AppDesigner
-from vortex.soap import DatabaseDesigner
-from vortex.soap import DownloadDesigner
-from vortex.soap import ServerDesigner
 from vortex.workspace import SAMPLE_CONFIG
 from vortex.workspace import ServerConfigError
 from vortex.workspace import Workspace
@@ -46,13 +46,13 @@ logging.getLogger("watchfiles").setLevel(logging.ERROR)
 logger = logging.getLogger("vortex")
 
 
-def check_class_file_version(
+def _check_class_file_version(
     class_file_bytes: bytes, expected_version: JavaClassVersion
 ) -> tuple[bool, str]:
     # https://en.wikipedia.org/wiki/Java_class_file#General_layout
     bytes_header = class_file_bytes[:8]
     if bytes_header[:4] != b"\xca\xfe\xba\xbe":
-        return (False, "Not a valid Java Class File")
+        return False, "Not a valid Java Class File"
     major_version = int.from_bytes(bytes_header[6:8], byteorder="big")
     minor_version = int.from_bytes(bytes_header[4:6], byteorder="big")
     compiled_version: JavaClassVersion = (major_version, minor_version)
@@ -62,27 +62,25 @@ def check_class_file_version(
             f"File has been compiled with Java Class Version"
             f"{compiled_version} but expected {expected_version}",
         )
-
     return True, ""
 
 
-async def _upload_design(
-    design_path: DesignPath, download_designer: DownloadDesigner
-) -> None:
+async def _upload_design(design_path: DesignPath, server: PuakmaServer) -> None:
     app = design_path.app
-    with open(design_path, "rb") as f:
-        file_bytes = f.read()
-
+    try:
+        file_bytes = await asyncio.to_thread(design_path.path.read_bytes)
+    except OSError as e:
+        _warn_failed_upload(design_path, e.strerror)
+        return
     # If we are uploading a class file, lets verify if it has been compiled correctly
     if design_path.file_ext == ".class" and app.java_class_version:
-        is_valid, msg = check_class_file_version(file_bytes, app.java_class_version)
+        is_valid, msg = _check_class_file_version(file_bytes, app.java_class_version)
         if not is_valid:
-            _warn_event(design_path, msg)
+            _warn_failed_upload(design_path, msg)
             return
-
     objs = app.lookup_design_obj(design_path.design_name)
     if len(objs) != 1:
-        _warn_event(design_path, f"Too many or no matches {objs}")
+        _warn_failed_upload(design_path, f"Too many or no matches {objs}")
         return
 
     obj = objs.pop()
@@ -91,7 +89,8 @@ async def _upload_design(
         obj.design_source = file_bytes
     else:
         obj.design_data = file_bytes
-    ok = await obj.upload(download_designer, upload_source)
+
+    ok = await obj.upload(server.download_designer, upload_source)
     _log_upload_status(ok, obj, upload_source)
 
 
@@ -101,104 +100,111 @@ def _log_upload_status(status_ok: bool, obj: DesignObject, do_source: bool) -> N
     logger.log(level, f"Upload {upload_type} of Design Object {obj}: {ok}")
 
 
-def _warn_event(path: str | DesignPath, err_msg: str) -> None:
+def _warn_failed_upload(path: str | DesignPath, err_msg: str) -> None:
     fname = os.path.basename(path)
-    logger.warning(f"Failed to process '{fname}': {err_msg}")
-
-
-async def _handle_changes(
-    changes: set[tuple[Change, str]],
-    workspace: Workspace,
-    download_designer: DownloadDesigner,
-) -> None:
-    for _, path in changes:
-        design_path = DesignPath(workspace, path)
-        asyncio.create_task(_upload_design(design_path, download_designer))
+    logger.warning(f"Failed to upload '{fname}': {err_msg}")
 
 
 class WorkspaceFilter(BaseFilter):
     def __init__(self, workspace: Workspace, server: PuakmaServer) -> None:
-        super().__init__()
         self.workspace = workspace
         self.server = server
 
     def __call__(self, change: Change, path: str) -> bool:
-        if os.path.isfile(path) and (
+        _do_event = os.path.isfile(path) and (
             change == Change.modified
             or (change == Change.added and path.endswith(".class"))
-        ):
-            try:
-                design_path = DesignPath(self.workspace, path)
-                design_server = design_path.app.server
-                if design_server == self.server:
-                    return True
-                _warn_event(path, f"({design_server}) does not match ({self.server})")
-            except InvalidDesignPathError as e:
-                _warn_event(path, str(e))
+        )
+        if not _do_event:
+            return False
+        try:
+            design_path = DesignPath(self.workspace, path)
+            design_server_host = design_path.app.host
+            if design_server_host == self.server.host:
+                return True
+            else:
+                _warn_failed_upload(
+                    path, f"({design_server_host}) does not match ({self.server.host})"
+                )
+        except InvalidDesignPathError as e:
+            _warn_failed_upload(path, str(e))
         return False
 
 
-async def _watch_for_changes(
+async def _handle_changes(
     workspace: Workspace,
     server: PuakmaServer,
+    changes: set[tuple[Change, str]],
 ) -> None:
-    async with server.aconnect() as client:
-        logger.debug(await ServerDesigner(server, client).ainitiate_connection())
-        download_designer = DownloadDesigner(server, client)
+    tasks = []
+    for _, path in changes:
+        design_path = DesignPath(workspace, path)
+        tasks.append(asyncio.create_task(_upload_design(design_path, server)))
+    try:
+        await asyncio.gather(*tasks)
+    except Exception as e:
+        raise e
+
+
+async def _watch_for_changes(workspace: Workspace, server: PuakmaServer) -> int:
+    async def _gather_changes(_changes: set[tuple[Change, str]]) -> bool:
+        try:
+            await asyncio.gather(_handle_changes(workspace, server, _changes))
+        except Exception as e:
+            logger.critical(e)
+            return True
+        return False
+
+    _error = False
+    async with server as s:
+        try:
+            msg = await s.server_designer.ainitiate_connection()
+            logger.info(msg.strip())
+        except Exception as e:
+            logger.critical(e)
+            return 1
+
+        _filter = WorkspaceFilter(workspace, server)
         changes = None
         while True:
             try:
-                async for changes in awatch(
-                    *workspace.listdir(),
-                    watch_filter=WorkspaceFilter(workspace, server),
-                ):
-                    asyncio.create_task(
-                        _handle_changes(changes, workspace, download_designer)
-                    )
+                async for changes in awatch(*workspace.listdir(), watch_filter=_filter):
+                    _error = await _gather_changes(changes)
+                    if _error:
+                        break
             except Exception as e:
                 logger.error(e)
                 if changes:
-                    asyncio.create_task(
-                        _handle_changes(changes, workspace, download_designer)
-                    )
+                    _error = await _gather_changes(changes)
+            if _error:
+                break
+    return 1 if _error else 0
 
 
-def watch(workspace: Workspace, server_name: str | None) -> int:
+def watch(workspace: Workspace, server: PuakmaServer) -> int:
     if not workspace.listdir():
         logger.error(f"No application directories to watch in workspace '{workspace}'")
         return 1
-
-    try:
-        server = workspace.read_server_from_config(server_name)
-    except ServerConfigError as e:
-        logger.error(e)
-        return 1
-
     with (
         workspace.exclusive_lock(),
-        util.spinner("Watching workspace for changes... Press ^C to stop"),
+        util.spinner("Watching workspace, ^C to stop"),
     ):
-        asyncio.run(_watch_for_changes(workspace, server))
-    return 0
+        return asyncio.run(_watch_for_changes(workspace, server))
 
 
 def fetch_and_parse_app_xml(
-    app_designer: AppDesigner, app_id: int
+    server: PuakmaServer, app_id: int
 ) -> tuple[PuakmaApplication, ET.Element]:
-    _err_msg = f"Error Cloning Application [{app_id}]: %s"
-
-    app_xml = app_designer.get_application_xml(app_id)
+    app_xml = server.app_designer.get_application_xml(app_id)
     app_ele = app_xml.find("puakmaApplication", namespaces=None)
     if not app_ele:
-        raise ValueError(_err_msg % "Application does not exist")
+        raise ValueError(f"Application [{app_id}] does not exist")
 
     java_version_ele = app_xml.find('.//sysProp[@name="java.class.version"]')
     if java_version_ele is None or java_version_ele.text is None:
-        raise ValueError(_err_msg % "Java class version not specified")
-
+        raise ValueError("Java class version not specified")
     major, minor = (int(v) for v in java_version_ele.text.split(".", maxsplit=1))
     version: JavaClassVersion = (major, minor)
-
     app = PuakmaApplication(
         id=int(app_ele.attrib["id"]),
         name=app_ele.attrib["name"],
@@ -206,7 +212,7 @@ def fetch_and_parse_app_xml(
         inherit_from=app_ele.attrib["inherit"],
         template_name=app_ele.attrib["template"],
         java_class_version=version,
-        server=app_designer.server,
+        host=server.host,
     )
     return app, app_ele
 
@@ -230,7 +236,8 @@ def match_and_validate_design_objs(
         ele = design_objs_eles.get(obj.id)
         if ele:
             obj.is_jar_library = ele.get("library", "false") == "true"
-            obj.package = ele.get("package", None)
+            package = ele.get("package", None)
+            obj.package_dir = Path(*package.split(".")) if package else None
         if not ele or not validate_crc32_checksum(obj, ele):
             design_objs.remove(obj)
             logger.warning(
@@ -242,33 +249,30 @@ def clone(
     app_id: int,
     *,
     workspace: Workspace,
-    app_designer: AppDesigner,
-    database_designer: DatabaseDesigner,
+    server: PuakmaServer,
     get_resources: bool,
 ) -> tuple[PuakmaApplication | None, int]:
     """Clone a Puakma Application into a newly created directory"""
 
-    logger.info(f"Cloning [{app_id}] from {app_designer.server.host}...")
+    logger.info(f"Cloning [{app_id}] from {server.host}...")
 
     try:
-        app, app_ele = fetch_and_parse_app_xml(app_designer, app_id)
-        design_elements = app_ele.findall("designElement", namespaces=None)
+        app, app_ele = fetch_and_parse_app_xml(server, app_id)
     except (ValueError, KeyError) as e:
         logger.error(e)
         return None, 1
 
-    logger.info(f"Fetching Design Objects for [{app_id}]...")
-    design_objects = app.fetch_design_objects(database_designer, get_resources)
+    logger.info(f"Fetching Design Objects [{app_id}]...")
+    objs = app.fetch_design_objects(server, get_resources)
+    eles = app_ele.findall("designElement", namespaces=None)
 
-    logger.info(
-        f"Saving {len(design_objects)} ({len(design_elements)}) "
-        f"Design Objects for [{app_id}]..."
-    )
-    match_and_validate_design_objs(design_objects, design_elements)
-    app.design_objects = tuple(design_objects)
+    match_and_validate_design_objs(objs, eles)
+    app.design_objects = tuple(objs)
     app_dir = workspace.mkdir(app)
 
+    # TODO: This doesn't catch KeyboardInterupt
     with util.clean_dir_on_failure(app_dir):
+        logger.info(f"Saving {len(objs)} ({len(eles)}) Design Objects [{app_id}]...")
         for obj in app.design_objects:
             obj.save(workspace)
 
@@ -293,28 +297,24 @@ def open_app_urls(*apps: PuakmaApplication, open_dev_url: bool = True) -> None:
 
 def clone_apps(
     workspace: Workspace,
-    server_name: str | None,
+    server: PuakmaServer,
     app_ids: list[int],
     get_resources: bool,
     open_urls: bool,
 ) -> int:
-    try:
-        server = workspace.read_server_from_config(server_name)
-    except ServerConfigError as e:
-        logger.error(e)
-        return 1
-
-    with workspace.exclusive_lock(), server.connect() as client:
+    with workspace.exclusive_lock():
         fn = functools.partial(
             clone,
             workspace=workspace,
-            app_designer=AppDesigner(server, client),
-            database_designer=DatabaseDesigner(server, client),
+            server=server,
             get_resources=get_resources,
         )
         todo = [id for id in set(app_ids)]
-
-        with concurrent.futures.ThreadPoolExecutor() as ex:
+        with (
+            server,
+            util.spinner(f"Cloning {app_ids}..."),
+            concurrent.futures.ThreadPoolExecutor() as ex,
+        ):
             results = ex.map(fn, todo)
 
         ret = 0
@@ -324,7 +324,6 @@ def clone_apps(
             ret |= ret_code
 
         ret |= workspace.update_vscode_settings()
-
     return ret
 
 
@@ -350,77 +349,63 @@ def _render_app_list(apps: list[PuakmaApplication], show_inherited: bool) -> Non
         print(row.format(*row_data))
 
 
-def list_(
+def list_apps(
     workspace: Workspace,
-    server_name: str | None,
-    group_filter: str,
-    name_filter: str,
-    template_filter: str,
+    server: PuakmaServer,
+    group_filter: list[str],
+    name_filter: list[str],
+    template_filter: list[str],
     show_ids_only: bool,
     show_inherited: bool,
     show_local_only: bool,
     open_urls: bool,
     open_dev_urls: bool,
 ) -> int:
-    """list puakma applications on the server"""
-
     if show_local_only:
-        apps = workspace.apps()
+        apps = [PuakmaApplication.from_dir(dir) for dir in workspace.listdir()]
     else:
-        try:
-            server = workspace.read_server_from_config(server_name)
-        except ServerConfigError as e:
-            logger.error(e)
-            return 1
-
-        with server.connect() as client:
-            database_designer = DatabaseDesigner(server, client)
-            apps = server.fetch_all_apps(
-                database_designer,
+        apps = []
+        with server as s:
+            apps = s.fetch_all_apps(
                 name_filter,
                 group_filter,
                 template_filter,
                 show_inherited,
             )
-
     if open_urls or open_dev_urls:
         open_app_urls(*apps, open_dev_url=open_dev_urls)
-        return 0
-
-    if show_ids_only:
-        for app in apps:
-            print(app.id)
     else:
-        _render_app_list(apps, show_inherited)
-
+        if show_ids_only:
+            for app in apps:
+                print(app.id)
+        else:
+            _render_app_list(apps, show_inherited)
     return 0
 
 
 def clean(workspace: Workspace) -> int:
-    app_dirs = workspace.listdir()
+    app_dirs = workspace.listdir(strict=False)
     ret = 0
     if app_dirs:
         with workspace.exclusive_lock():
             for app_dir in app_dirs:
                 shutil.rmtree(app_dir)
-                logger.info(f"Deleted application directory '{app_dir}'")
+                logger.info(f"Deleted directory '{app_dir}'")
             ret = workspace.update_vscode_settings()
     return ret
 
 
 def code(workspace: Workspace, args: list[str]) -> int:
-    if not os.path.exists(workspace.code_workspace_file) and "--help" not in args:
+    if not workspace.code_workspace_file.exists() and "--help" not in args:
         raise FileNotFoundError(f"{workspace.code_workspace_file} does not exist")
 
     args.insert(0, str(workspace.code_workspace_file))
-
+    cmd = "code"
     try:
-        return util.execute_cmd("code", args)
+        return util.execute_cmd(cmd, args)
     except FileNotFoundError:
-        raise FileNotFoundError(
-            "Unable to open Visual Studio Code. "
-            "Couldn't find 'code' executable in system PATH."
-        )
+        logger.error(f"VSCode '{cmd}' command not found. Check system PATH.")
+        return 1
 
 
 def config(
@@ -451,18 +436,64 @@ def config(
     return 0
 
 
+def log(server: PuakmaServer, limit: int) -> int:
+    with server as s:
+        logs = s.get_last_log_items(limit)
+
+    row = "{:<9}{:^5}{:<31}{:<80}"
+    row_headers = ("Time", "Type", "Source", "Message")
+    print(row.format(*row_headers))
+
+    for log in sorted(logs, key=lambda x: (x.id)):
+        row_data = [
+            datetime.strftime(log.date, "%H:%M:%S"),
+            log.type,
+            util.shorten_text(log.item_source),
+        ]
+
+        log_lines = log.msg.strip().splitlines()
+        for i, line in enumerate(log_lines):
+            wrapped_lines = textwrap.wrap(line.strip(), width=80)
+            for j, output_line in enumerate(wrapped_lines):
+                if i == 0 and j == 0:
+                    row_data.append(output_line)
+                    print(row.format(*row_data))
+                    continue
+                print(row.format("", "", "", output_line))
+    return 0
+
+
 @contextlib.contextmanager
-def error_handler() -> Generator[None, None, None]:
+def error_handler(with_tb: bool = True) -> Generator[None, None, None]:
     try:
         yield
-    except WorkspaceInUseError as e:
+    except (WorkspaceInUseError, ServerConfigError, HTTPStatusError) as e:
         logger.error(e)
         raise SystemExit(1)
     except KeyboardInterrupt:
         raise SystemExit(130)
     except BaseException as e:
-        logger.error(e, stack_info=True, exc_info=True)
+        logger.critical(e, stack_info=with_tb, exc_info=with_tb)
         raise SystemExit(1)
+
+
+def _add_server_option(*parsers: argparse.ArgumentParser) -> None:
+    for p in parsers:
+        p.add_argument(
+            "--server",
+            "-s",
+            metavar="NAME",
+            help="Enter the name of the server definition in the config file to use",
+        )
+
+
+def _add_debug_option(*parsers: argparse.ArgumentParser) -> None:
+    for p in parsers:
+        p.add_argument(
+            "--debug",
+            help="Set this flag to see DEBUG messages",
+            action="store_true",
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -485,24 +516,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="List Puakma Applications on the server or cloned locally",
     )
     list_parser.add_argument(
-        "--server",
-        "-s",
-        help="Enter the name of the server definition in the config file to use",
-    )
-    list_parser.add_argument(
         "--group",
         "-g",
-        help="Enter an application 'group' substring to filter the results",
+        nargs="*",
+        help="Enter an application 'group' substrings to filter the results",
     )
     list_parser.add_argument(
         "--name",
         "-n",
-        help="Enter an application 'name' substring to filter the results",
+        nargs="*",
+        help="Enter application 'name' substrings to filter the results",
     )
     list_parser.add_argument(
         "--template",
         "-t",
-        help="Enter an application 'template' substring to filter the results",
+        nargs="*",
+        help="Enter application 'template' substrings to filter the results",
     )
     list_parser.add_argument(
         "--local",
@@ -516,7 +545,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
     )
     list_parser.add_argument(
-        "--output-ids-only",
+        "--ids-only",
         "-x",
         help=(
             "Set this flag to only display the ID's of the applications in the output"
@@ -540,11 +569,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     clone_parser = command_parser.add_parser(
         "clone",
         help="Clone a Puakma Application and it's design objects into the workspace",
-    )
-    clone_parser.add_argument(
-        "--server",
-        "-s",
-        help="Enter the name of the server definition in the config file to use",
     )
     clone_parser.add_argument(
         "app_ids",
@@ -579,14 +603,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             "and upload them to the server"
         ),
     )
-    watch_parser.add_argument(
-        "--server",
-        "-s",
-        help="Enter the name of the server definition in the config file to use",
-    )
-    watch_parser.add_argument(
-        "--debug", help="Set this flag to see DEBUG messages", action="store_true"
-    )
 
     command_parser.add_parser(
         "clean",
@@ -595,11 +611,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     config_parser = command_parser.add_parser(
         "config", help="View and manage configuration"
-    )
-    config_parser.add_argument(
-        "--server",
-        "-s",
-        help="Enter the name of the server definition in the config file to use",
     )
     config_parser.add_argument(
         "--sample",
@@ -636,16 +647,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
 
+    log_parser = command_parser.add_parser(
+        "log",
+        help="View the last items in the server log",
+    )
+    log_parser.add_argument(
+        "-n",
+        type=int,
+        help="The number of logs to return (1 - 50). Default is %(default)s.",
+        default=10,
+        dest="limit",
+    )
+
+    _server_debug_parsers = (list_parser, clone_parser, watch_parser, log_parser)
+    _add_server_option(*_server_debug_parsers, config_parser)
+    _add_debug_option(*_server_debug_parsers)
+
     args, remaining_args = parser.parse_known_args(argv)
 
     if args.command != "code":
-        # call this for validation
+        # Call this for validation
         parser.parse_args(argv)
 
     with error_handler():
         workspace_path = getattr(args, "workspace", None)
         server_name = getattr(args, "server", None)
-
         try:
             do_init = args.command == "config" and args.init
             workspace = Workspace(workspace_path, do_init)
@@ -656,27 +682,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 1
 
-        if args.command in ("list", "ls"):
-            return list_(
-                workspace,
-                server_name,
-                args.group,
-                args.name,
-                args.template,
-                args.show_ids_only,
-                args.show_inherited,
-                args.show_local_only,
-                args.open_urls,
-                args.open_dev_urls,
-            )
-        elif args.command == "clone":
-            return clone_apps(
-                workspace, server_name, args.app_ids, args.get_resources, args.open_urls
-            )
-        elif args.command == "watch":
+        if args.command in ["list", "ls", "clone", "watch", "log"]:
+            server = workspace.read_server_from_config(server_name)
             if args.debug:
                 logger.setLevel(logging.DEBUG)
-            return watch(workspace, server_name)
+                logging.getLogger("httpx").setLevel(logging.DEBUG)
+                logging.getLogger("watchfiles").setLevel(logging.INFO)
+            if args.command in ("list", "ls"):
+                return list_apps(
+                    workspace,
+                    server,
+                    args.group,
+                    args.name,
+                    args.template,
+                    args.show_ids_only,
+                    args.show_inherited,
+                    args.show_local_only,
+                    args.open_urls,
+                    args.open_dev_urls,
+                )
+            elif args.command == "clone":
+                return clone_apps(
+                    workspace, server, args.app_ids, args.get_resources, args.open_urls
+                )
+            elif args.command == "watch":
+                return watch(workspace, server)
+            elif args.command == "log":
+                return log(server, args.limit)
         elif args.command == "clean":
             return clean(workspace)
         elif args.command == "code":
@@ -698,7 +730,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command:
             raise NotImplementedError(f"Command '{args.command}' is not implemented.")
-
     return 0
 
 

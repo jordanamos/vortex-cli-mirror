@@ -107,6 +107,7 @@ def clean_dir_on_failure(path: Path) -> Generator[None, None, None]:
         yield
     except BaseException:
         if os.path.exists(path):
+            logger.info(f"Cleaning up {path}...")
             shutil.rmtree(path)
         raise
 
@@ -137,3 +138,12 @@ def spinner(message: str) -> Generator[None, None, None]:
         thread.join()
         sys.stdout.write(f"'\033[?25h'{clear}")
         sys.stdout.flush()
+
+
+def shorten_text(text: str, max_len: int = 30) -> str:
+    if len(text) <= max_len:
+        return text
+    max_len -= len("...")
+    start_len = max_len // 2
+    end_len = max_len - start_len
+    return f"{text[:start_len]}...{text[-end_len:]}"

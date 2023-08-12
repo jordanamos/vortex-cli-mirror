@@ -1,28 +1,29 @@
 from __future__ import annotations
 
 import base64
-import contextlib
 import getpass
 import logging
 import mimetypes
 import os
 import pickle
-from collections.abc import AsyncGenerator
-from collections.abc import Generator
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from io import StringIO
 from pathlib import Path
+from types import TracebackType
+from typing import Literal
 from typing import NamedTuple
 from typing import TYPE_CHECKING
 
 import httpx
 
-from vortex.util import VERSION
+from vortex.soap import AppDesigner
+from vortex.soap import DatabaseDesigner
+from vortex.soap import DownloadDesigner
+from vortex.soap import ServerDesigner
 
 if TYPE_CHECKING:
-    from vortex.soap import DatabaseDesigner
-    from vortex.soap import DownloadDesigner
     from vortex.workspace import Workspace
 
 mimetypes.add_type("text/javascript", ".js")
@@ -31,14 +32,18 @@ mimetypes.add_type("application/java", ".java")
 
 logger = logging.getLogger("vortex")
 
-
+_JAVA_MIME_TYPES = (
+    "application/java",
+    "application/octet-stream",
+    "application/javavm",
+)
 _DESIGN_OBJECT_QUERY = """\
 SELECT designbucketid AS id
     , name
-    , designtype AS design_type
-    , contenttype AS content_type
-    , designdata AS design_data
-    , designsource AS design_source
+    , designtype AS type
+    , contenttype AS ctype
+    , designdata AS data
+    , designsource AS src
 FROM designbucket
 WHERE appid = %d
 """
@@ -55,98 +60,139 @@ ORDER BY appgroup
     , appname
 """
 
-_JAVA_MIME_TYPES = (
-    "application/java",
-    "application/octet-stream",
-    "application/javavm",
-)
-_USER_AGENT = f"vortex-cli/{VERSION}"
-
-
 JavaClassVersion = tuple[int, int]
 
 
-class PuakmaServer(NamedTuple):
-    host: str
-    port: int
-    soap_path: str
-    puakma_db_conn_id: int
-    username: str | None
-    password: str | None
+class LogItem(NamedTuple):
+    id: int
+    msg: str
+    date: datetime
+    type: str
+    item_source: str
+    username: str
+
+
+class PuakmaServer:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        soap_path: str,
+        puakma_db_conn_id: int,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> None:
+        self._host = host
+        self._port = port
+        self.soap_path = soap_path
+        self.puakma_db_conn_id = puakma_db_conn_id
+        self.username = username or input("Enter your Username: ")
+        self.password = password or getpass.getpass("Enter your Password: ")
+        self.app_designer = AppDesigner(self)
+        self.database_designer = DatabaseDesigner(self)
+        self.download_designer = DownloadDesigner(self)
+        self.server_designer = ServerDesigner(self)
+        self._aclient = httpx.AsyncClient(auth=self.auth)
+        self._client = httpx.Client(auth=self.auth)
+
+    @property
+    def host(self) -> str:
+        return self._host
+
+    @property
+    def port(self) -> int:
+        return self._port
+
+    @property
+    def auth(self) -> tuple[str, str]:
+        return self.username, self.password
 
     @property
     def base_soap_url(self) -> str:
-        return f"http://{self.host}:{self.port}/{self.soap_path}"
+        return f"{self}/{self.soap_path}"
 
-    @property
-    def base_webdesign_url(self) -> str:
-        return f"http://{self.host}/system/webdesign.pma"
+    def __str__(self) -> str:
+        return f"http://{self.host}:{self.port}"
 
-    @contextlib.contextmanager
-    def connect(self) -> Generator[httpx.Client, None, None]:
-        user = self.username or input("Enter your Username: ")
-        password = self.password or getpass.getpass("Enter your Password: ")
-        headers = {"user-agent": _USER_AGENT}
-        auth = (user, password)
-        with contextlib.closing(httpx.Client(auth=auth, headers=headers)) as sess:
-            yield sess
+    def __enter__(self) -> PuakmaServer:
+        return self
 
-    @contextlib.asynccontextmanager
-    async def aconnect(self) -> AsyncGenerator[httpx.AsyncClient, None]:
-        user = self.username or input("Enter your Username: ")
-        password = self.password or getpass.getpass("Enter your Password: ")
-        headers = {"user-agent": _USER_AGENT}
-        auth = (user, password)
-        async with contextlib.aclosing(
-            httpx.AsyncClient(auth=auth, headers=headers)
-        ) as sess:
-            yield sess
+    async def __aenter__(self) -> PuakmaServer:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None = None,
+    ) -> Literal[False]:
+        await self._aclient.aclose()
+        return False
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None = None,
+    ) -> Literal[False]:
+        self._client.close()
+        return False
 
     def fetch_all_apps(
         self,
-        database_designer: DatabaseDesigner,
-        name_filter: str,
-        group_filter: str,
-        template_filter: str,
+        name_filter: list[str],
+        group_filter: list[str],
+        template_filter: list[str],
         show_inherited: bool,
     ) -> list[PuakmaApplication]:
         where = StringIO()
         where.write("WHERE 1=1")
+
+        def _or(field: str, values: list[str]) -> None:
+            where.write("AND (")
+            for i, val in enumerate(values):
+                if i > 0:
+                    where.write(" OR ")
+                where.write(f"LOWER({field}) LIKE '%{val.lower()}%'")
+            where.write(")")
+
         if not show_inherited:
             where.write(" AND (inheritfrom IS NULL OR inheritfrom = '')")
         if name_filter:
-            where.write(f" AND LOWER(appname) LIKE '%{name_filter.lower()}%'")
+            _or("appname", name_filter)
         if group_filter:
-            where.write(f" AND LOWER(appgroup) LIKE '%{group_filter.lower()}%'")
+            _or("appgroup", group_filter)
         if template_filter:
-            where.write(f" AND LOWER(templatename) LIKE '%{template_filter.lower()}%'")
+            _or("templatename", template_filter)
 
         query = _PUAKMA_APPLICATION_QUERY % where.getvalue()
         where.close()
-        resp = database_designer.execute_query(self.puakma_db_conn_id, query)
+        resp = self.database_designer.execute_query(self.puakma_db_conn_id, query)
+        return [PuakmaApplication(**app, host=self.host) for app in resp]
 
-        return [PuakmaApplication(**app, server=self) for app in resp]
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, PuakmaServer):
-            return (
-                self.host == other.host
-                and self.port == other.port
-                and self.puakma_db_conn_id == other.puakma_db_conn_id
+    def get_last_log_items(self, limit_items: int = 10) -> list[LogItem]:
+        limit_items = min(max(limit_items, 1), 50)
+        query = f"""\
+            SELECT *
+            FROM pmalog
+            WHERE type <> 'I'
+            ORDER BY logdate DESC
+            LIMIT {limit_items}
+        """
+        resp = self.database_designer.execute_query(self.puakma_db_conn_id, query)
+        log_date_format = "%Y-%m-%d %H:%M:%S.%f"
+        logs = [
+            LogItem(
+                int(log["logid"]),
+                log["logstring"],
+                datetime.strptime(log["logdate"], log_date_format),
+                log["type"],
+                log["source"],
+                log["username"],
             )
-        return False
-
-    def __ne__(self, other: object) -> bool:
-        if isinstance(other, PuakmaServer):
-            return not (
-                self.host == other.host
-                and self.port == other.port
-                and self.puakma_db_conn_id == other.puakma_db_conn_id
-            )
-        return True
-
-    def __str__(self) -> str:
-        return f"{self.host}:{self.port}"
+            for log in resp
+        ]
+        return logs
 
 
 class PuakmaApplication:
@@ -159,7 +205,7 @@ class PuakmaApplication:
         group: str,
         inherit_from: str,
         template_name: str,
-        server: PuakmaServer,
+        host: str,
         java_class_version: JavaClassVersion | None = None,
     ) -> None:
         self.id = id
@@ -167,21 +213,22 @@ class PuakmaApplication:
         self.group = group
         self.inherit_from = inherit_from
         self.template_name = template_name
-        self.server = server
+        self.host = host
         self.java_class_version = java_class_version
         self._design_objects: tuple[DesignObject, ...] = tuple()
 
     @property
     def dir_name(self) -> str:
-        return f"{self.server.host}_{self.group}_{self.name}"
+        return f"{self.host}_{self.group}_{self.name}"
 
     @property
     def url(self) -> str:
-        return f"http://{self.server.host}/{self.group}/{self.name}.pma"
+        return f"http://{self.host}/{self.group}/{self.name}.pma"
 
     @property
     def web_design_url(self) -> str:
-        return f"{self.server.base_webdesign_url}/DesignList?OpenPage&AppID={self.id}"
+        base_url = f"http://{self.host}/system/webdesign.pma"
+        return f"{base_url}/DesignList?OpenPage&AppID={self.id}"
 
     @property
     def design_objects(self) -> tuple[DesignObject, ...]:
@@ -190,6 +237,9 @@ class PuakmaApplication:
     @design_objects.setter
     def design_objects(self, value: tuple[DesignObject]) -> None:
         self._design_objects = tuple(value)
+
+    def __str__(self) -> str:
+        return f"{self.group}/{self.name}"
 
     @classmethod
     def from_dir(cls, path: Path | str) -> PuakmaApplication:
@@ -202,54 +252,43 @@ class PuakmaApplication:
         try:
             with open(app_file, "rb") as f:
                 app = pickle.load(f)
-            if isinstance(app, cls):
-                return app
-            else:
-                raise ValueError(f"Unexpected instance {type(app)}")
-        except (FileNotFoundError, pickle.UnpicklingError, ValueError) as e:
+            if not isinstance(app, cls):
+                raise TypeError(f"Unexpected instance of type {type(app)}")
+        except Exception as e:
             raise ValueError(f"Error initialising {cls}: {e}")
-
-    def lookup_design_obj(self, design_name: str) -> list[DesignObject]:
-        return [obj for obj in self.design_objects if obj.name == design_name]
+        else:
+            return app
 
     def fetch_design_objects(
-        self, database_designer: DatabaseDesigner, get_resources: bool = False
+        self, server: PuakmaServer, get_resources: bool = False
     ) -> list[DesignObject]:
         resources_where = (
             "" if get_resources else f" AND designtype <> {DesignType.RESOURCE.value}"
         )
         query = f"{_DESIGN_OBJECT_QUERY}{resources_where}" % self.id
-
-        result = database_designer.execute_query(self.server.puakma_db_conn_id, query)
-        design_objs: list[DesignObject] = []
-
+        result = server.database_designer.execute_query(server.puakma_db_conn_id, query)
+        objs: list[DesignObject] = []
         for obj in result:
-            design_type_id = int(obj["design_type"])
-            design_name = obj["name"]
-
+            design_type_id = int(obj["type"])
+            name = obj["name"]
+            id_ = int(obj["id"])
             try:
-                design_type = DesignType(design_type_id)
+                type_ = DesignType(design_type_id)
             except ValueError:
                 logger.debug(
-                    f"Skipped Design Object '{design_name}' [{obj['id']}]: "
+                    f"Skipped Design Object '{name}' [{obj['id']}]: "
                     f"Invalid Design Type [{design_type_id}]"
                 )
-            else:
-                design_objs.append(
-                    DesignObject(
-                        int(obj["id"]),
-                        design_name,
-                        design_type,
-                        obj["content_type"],
-                        obj["design_data"],
-                        obj["design_source"],
-                        self,
-                    )
+                continue
+            objs.append(
+                DesignObject(
+                    id_, name, type_, obj["ctype"], obj["data"], obj["src"], self
                 )
-        return design_objs
+            )
+        return objs
 
-    def __str__(self) -> str:
-        return f"{self.group}/{self.name}"
+    def lookup_design_obj(self, design_name: str) -> list[DesignObject]:
+        return [obj for obj in self.design_objects if obj.name == design_name]
 
 
 @dataclass(slots=True)
@@ -262,7 +301,7 @@ class DesignObject:
     _design_source: str
     app: PuakmaApplication
     is_jar_library: bool = False
-    package: str | None = None
+    package_dir: Path | None = None
 
     @property
     def design_data(self) -> bytes:
@@ -292,27 +331,22 @@ class DesignObject:
         return self.name + self.file_ext if self.file_ext else self.name
 
     @property
-    def design_dir(self) -> str:
+    def design_dir(self) -> Path:
         if self.is_jar_library:
-            return "zlib"
-        dir_name = self.design_type.name
-        if self.design_type.is_java_type and self.package:
-            dir_name = os.path.join(dir_name, self.package)
+            return Path("zlib")
+        dir_name = Path(self.design_type.name)
+        if self.design_type.is_java_type and self.package_dir:
+            dir_name /= self.package_dir
         return dir_name
 
     @property
     def do_save_source(self) -> bool:
         return self.design_type.is_java_type and not self.is_jar_library
 
-    def get_design_path(self, workspace: Workspace) -> DesignPath:
+    def design_path(self, workspace: Workspace) -> DesignPath:
         return DesignPath(
             workspace,
-            os.path.join(
-                workspace.path,
-                self.app.dir_name,
-                self.design_dir,
-                self.file_name,
-            ),
+            workspace.path / self.app.dir_name / self.design_dir / self.file_name,
         )
 
     async def upload(
@@ -325,7 +359,7 @@ class DesignObject:
         data_bytes = self.design_data
         if self.do_save_source:
             data_bytes = self.design_source
-        design_path = self.get_design_path(workspace)
+        design_path = self.design_path(workspace)
         design_path.path.parent.mkdir(parents=True, exist_ok=True)
         with open(design_path, "wb") as f:
             f.write(data_bytes)
@@ -339,7 +373,8 @@ class DesignType(Enum):
     RESOURCE = 2
     ACTION = 3
     SHARED_CODE = 4
-    # DOCUMENTATION = 5 This appears to use source rather than data >.<
+    # This appears to use source rather than data >.<
+    # DOCUMENTATION = 5
     SCHEDULED_ACTION = 6
     WIDGET = 7
 
@@ -374,28 +409,24 @@ class InvalidDesignPathError(Exception):
 
 class DesignPath:
     """
-    Represents a path to a Design Object.
-    The path should be the full path to the object
-    Raises InvalidDesignPathError if:
-        - the app_directory is not valid
-        - the path is not in the expected format
+    Represents a path to a Design Object. Expects format:
+    /path/to/workspace/app_dir/design_dir/.../obj
+    otherwise a InvalidDesignPathError is raised
     """
 
-    def __init__(self, workspace: Workspace, path: str) -> None:
+    def __init__(self, workspace: Workspace, path: str | Path) -> None:
         try:
             rel_path = os.path.relpath(path, workspace.path)
-            app_dir, design_type_dir, _remaining = rel_path.split(
-                os.path.sep, maxsplit=2
-            )
+            app_dir, design_dir, _remainder = rel_path.split(os.path.sep, maxsplit=2)
             app_dir = os.path.join(workspace.path, app_dir)
             self.app = PuakmaApplication.from_dir(app_dir)
         except ValueError:
             raise InvalidDesignPathError(f"Invalid path to a Design Object '{path}'")
 
-        self.path = Path(path)
+        self.path = Path(path) if not isinstance(path, Path) else path
         self.rel_path = rel_path
         self.app_dir = app_dir
-        self.design_type_dir = design_type_dir
+        self.design_dir = design_dir
         self.file_name = os.path.basename(path)
         self.design_name, self.file_ext = os.path.splitext(self.file_name)
 

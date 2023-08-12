@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import gzip
 import logging
 import xml.etree.ElementTree as ET
 from abc import ABC
+from collections.abc import Generator
 from typing import Any
 from typing import Literal
 from typing import NamedTuple
 from typing import NoReturn
 from typing import TYPE_CHECKING
 
-import httpx
+from vortex.util import VERSION
 
 if TYPE_CHECKING:
     from vortex.models import PuakmaServer
@@ -20,35 +23,6 @@ _XSD_INTEGER: Literal["xsd:integer"] = "xsd:integer"
 _XSD_STRING: Literal["xsd:string"] = "xsd:string"
 _XSD_BOOLEAN: Literal["xsd:boolean"] = "xsd:boolean"
 _XSD_BASE64_BINARY: Literal["xsd:base64Binary"] = "xsd:base64Binary"
-
-
-class _PuakmaSOAPService(ABC):
-    SERVICE_NAME: str
-
-    def __init__(self, server: PuakmaServer, client: httpx.Client):
-        self._server = server
-        self._client = client
-
-    @property
-    def client(self) -> httpx.Client:
-        return self._client
-
-    @property
-    def server(self) -> PuakmaServer:
-        return self._server
-
-    @property
-    def endpoint(self) -> str:
-        return f"{self.server.base_soap_url}/{self.SERVICE_NAME}?WidgetExecute"
-
-
-class _AsyncPuakmaSOAPService(_PuakmaSOAPService):
-    def __init__(self, server: PuakmaServer, client: httpx.AsyncClient):
-        super().__init__(server, client)
-
-    @property
-    def client(self) -> httpx.AsyncClient:
-        return self._client
 
 
 class _SOAPParam(NamedTuple):
@@ -67,11 +41,30 @@ class SOAPResponseParseError(Exception):
         super().__init__(e)
 
 
-class _SOAPClient:
-    @staticmethod
+class _PuakmaSOAPService(ABC):
+    name: str
+    sem = asyncio.Semaphore(40)
+    headers = {
+        "content-type": "text/xml",
+        "content-encoding": "gzip",
+        "accept-encoding": "gzip",
+        "user-agent": f"vortex-cli/{VERSION}",
+    }
+
+    def __init__(self, server: PuakmaServer):
+        self._server = server
+
+    @property
+    def server(self) -> PuakmaServer:
+        return self._server
+
+    @property
+    def endpoint(self) -> str:
+        return f"{self.server.base_soap_url}/{self.name}?WidgetExecute"
+
     def _build_envelope(
-        service_name: str, operation: str, params: list[_SOAPParam] | None = None
-    ) -> str:
+        self, operation: str, params: list[_SOAPParam] | None = None
+    ) -> bytes:
         ns = "soapenv"
         envelope = ET.Element(
             "{%s}Envelope" % ns,
@@ -87,7 +80,7 @@ class _SOAPClient:
             body,
             f"{{{ns}}}{operation}",
             {
-                "xmlns:%s" % ns: "urn:%s" % service_name,
+                "xmlns:%s" % ns: "urn:%s" % self.name,
             },
         )
         if params:
@@ -96,10 +89,7 @@ class _SOAPClient:
                 e.text = str(param.value)
         return ET.tostring(envelope, encoding="utf-8")
 
-    @staticmethod
-    def _parse_response(
-        response_root: ET.Element, service_name: str, operation: str
-    ) -> ET.Element:
+    def _parse_response(self, response_root: ET.Element, operation: str) -> ET.Element:
         """
         Returns the root node of the expected SOAP response.
         If the response text is an xml document (CDATA), return the root
@@ -112,7 +102,7 @@ class _SOAPClient:
         def _error(msg: str, response: ET.Element | None) -> NoReturn:
             raise SOAPResponseParseError(msg, response)
 
-        resp = response_root.find(".//{urn:" + service_name + "}" + operation)
+        resp = response_root.find(".//{urn:" + self.name + "}" + operation)
         if not resp:
             _error("No matching response element", resp)
 
@@ -130,10 +120,8 @@ class _SOAPClient:
         except ET.ParseError:
             return return_node
 
-    @classmethod
     def post(
-        cls,
-        service: _PuakmaSOAPService,
+        self,
         operation: str,
         params: list[_SOAPParam] | None = None,
     ) -> ET.Element:
@@ -141,22 +129,19 @@ class _SOAPClient:
         Builds and sends a SOAP envelope to the service endpoint and returns the parsed
         response element. Raises HTTPStatusError if one occurred
         """
-
-        envelope = cls._build_envelope(service.SERVICE_NAME, operation, params)
-        resp = service.client.post(
-            service.endpoint,
-            content=envelope,
-            headers={"content-type": "text/xml"},
-            timeout=10,
+        envelope = self._build_envelope(operation, params)
+        resp = self.server._client.post(
+            self.endpoint,
+            content=gzip.compress(envelope),
+            headers=self.headers,
+            timeout=20,
         )
         resp.raise_for_status()
         tree = ET.fromstring(resp.text, parser=None)
-        return cls._parse_response(tree, service.SERVICE_NAME, operation)
+        return self._parse_response(tree, operation)
 
-    @classmethod
     async def apost(
-        cls,
-        service: _AsyncPuakmaSOAPService,
+        self,
         operation: str,
         params: list[_SOAPParam] | None = None,
     ) -> ET.Element:
@@ -165,47 +150,62 @@ class _SOAPClient:
         response element. Raises HTTPStatusError if one occurred
         """
 
-        envelope = cls._build_envelope(service.SERVICE_NAME, operation, params)
-        resp = await service.client.post(
-            service.endpoint,
-            content=envelope,
-            headers={"content-type": "text/xml"},
-            timeout=10,
-        )
+        envelope = self._build_envelope(operation, params)
+        async with self.sem:
+            resp = await self.server._aclient.post(
+                self.endpoint,
+                content=gzip.compress(envelope),
+                headers=self.headers,
+                timeout=20,
+            )
         resp.raise_for_status()
         tree = ET.fromstring(resp.text, parser=None)
-        return cls._parse_response(tree, service.SERVICE_NAME, operation)
+        return self._parse_response(tree, operation)
 
 
 class AppDesigner(_PuakmaSOAPService):
-    SERVICE_NAME: str = "AppDesigner"
+    name = "AppDesigner"
 
     def get_application_xml(self, app_id: int) -> ET.Element:
         """Returns an XML representation of a puakma application."""
         operation = "getApplicationXml"
         params = [_SOAPParam("p1", _XSD_INTEGER, app_id)]
-        resp = _SOAPClient.post(self, operation, params)
+        resp = self.post(operation, params)
         return resp
 
 
-class ServerDesigner(_AsyncPuakmaSOAPService):
-    SERVICE_NAME: str = "ServerDesigner"
+class ServerDesigner(_PuakmaSOAPService):
+    name = "ServerDesigner"
 
     async def ainitiate_connection(self) -> str:
         opertaion = "initiateConnection"
-        resp = await _SOAPClient.apost(self, opertaion)
+        resp = await self.apost(opertaion)
         return str(resp.text)
+
+    async def aget_last_log_items(
+        self, limit_items: int = 5, last_log_id: int | None = None
+    ) -> list[dict[str, str]]:
+        assert limit_items >= 0
+        if limit_items > 20:
+            limit_items = 20
+        operation = "getLastLogItems"
+        params = [
+            _SOAPParam("p1", _XSD_INTEGER, limit_items),
+            _SOAPParam("p2", _XSD_INTEGER, last_log_id),
+        ]
+        resp = await self.apost(operation, params)
+        return [log.attrib for log in resp.findall(".//logItem")]
 
 
 class DatabaseDesigner(_PuakmaSOAPService):
-    SERVICE_NAME: str = "DatabaseDesigner"
+    name = "DatabaseDesigner"
 
     def execute_query(
         self,
         db_conn_id: int,
         query: str,
         is_update: bool = False,
-    ) -> list[dict[str, Any]]:
+    ) -> Generator[dict[str, Any], None, None]:
         """Returns a list of dicts representing a return row"""
         operation = "executeQuery"
         params = [
@@ -213,26 +213,19 @@ class DatabaseDesigner(_PuakmaSOAPService):
             _SOAPParam("p2", _XSD_STRING, query),
             _SOAPParam("p3", _XSD_BOOLEAN, is_update),
         ]
-        resp = _SOAPClient.post(self, operation, params)
+        resp = self.post(operation, params)
         col_lookup = [
             meta_row.attrib["name"] for meta_row in resp.findall(".//metadata")
         ]
-        rows = []
         for row in resp.findall(".//row"):
-            rows.append(
-                {
-                    col_lookup[int(col.attrib["index"]) - 1]: col.text
-                    if col.text
-                    else ""
-                    for col in row
-                }
-            )
-
-        return rows
+            yield {
+                col_lookup[int(col.attrib["index"]) - 1]: col.text if col.text else ""
+                for col in row
+            }
 
 
-class DownloadDesigner(_AsyncPuakmaSOAPService):
-    SERVICE_NAME: str = "DownloadDesigner"
+class DownloadDesigner(_PuakmaSOAPService):
+    name = "DownloadDesigner"
 
     async def aupload_design(
         self,
@@ -249,5 +242,5 @@ class DownloadDesigner(_AsyncPuakmaSOAPService):
             _SOAPParam("p3", _XSD_BASE64_BINARY, base64data),
             _SOAPParam("p4", _XSD_BOOLEAN, flush_cache),
         ]
-        resp = await _SOAPClient.apost(self, operation, params)
+        resp = await self.apost(operation, params)
         return resp.text == "true"
