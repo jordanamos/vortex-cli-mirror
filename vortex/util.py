@@ -12,6 +12,7 @@ import threading
 import time
 from collections.abc import Callable
 from collections.abc import Generator
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 from typing import IO
@@ -19,6 +20,13 @@ from typing import IO
 logger = logging.getLogger("vortex")
 
 VERSION = importlib.metadata.version("vortex_cli")
+
+
+class Colour(StrEnum):
+    RED = "\033[41m"
+    BOLD = "\033[1m"
+    NORMAL = "\033[m"
+
 
 if sys.platform == "win32":
     import msvcrt
@@ -147,3 +155,10 @@ def shorten_text(text: str, max_len: int = 30) -> str:
     start_len = max_len // 2
     end_len = max_len - start_len
     return f"{text[:start_len]}...{text[-end_len:]}"
+
+
+def colour(text: str, colour: Colour, replace_in: str | None = None) -> str:
+    highlighted_txt = f"{colour}{text}{Colour.NORMAL}"
+    if replace_in:
+        highlighted_txt = replace_in.replace(text, highlighted_txt)
+    return highlighted_txt

@@ -122,16 +122,16 @@ class Workspace:
         with file_lock(self.path / ".lock", _blocked_cb):
             yield
 
-    def mkdir(self, app: PuakmaApplication) -> Path:
+    def mkdir(self, app: PuakmaApplication, force_recreate: bool = False) -> Path:
         """
         Creates a .PuakmaApplication.pickle file within a newly created app directory
         with the format 'host_group_name' inside the workspace.
         Returns the full path to the new app directory
         """
         app_path = self.path / app.dir_name
-        if app_path.exists():
+        if app_path.exists() and force_recreate:
             shutil.rmtree(app_path)
-        app_path.mkdir()
+        app_path.mkdir(exist_ok=True)
         with open(app_path / app.PICKLE_FILE, "wb") as f:
             pickle.dump(app, f)
         return app_path
@@ -158,6 +158,9 @@ class Workspace:
                         continue
                 ret.append(sub_dir)
         return ret
+
+    def listapps(self) -> list[PuakmaApplication]:
+        return [PuakmaApplication.from_dir(dir) for dir in self.listdir()]
 
     def read_server_from_config(self, server_name: str | None = None) -> PuakmaServer:
         def _error(msg: str) -> NoReturn:

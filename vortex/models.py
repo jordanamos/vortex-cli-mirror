@@ -8,7 +8,7 @@ import os
 import pickle
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
+from enum import IntEnum
 from io import StringIO
 from pathlib import Path
 from types import TracebackType
@@ -58,6 +58,19 @@ FROM application
 %s
 ORDER BY appgroup
     , appname
+"""
+
+_LOGS_QUERY = """\
+SELECT logid AS id
+    , logstring AS msg
+    , logdate AS date
+    , type
+    , source AS src
+    , username AS user
+FROM pmalog
+WHERE type <> 'I'
+ORDER BY logdate DESC
+LIMIT % d
 """
 
 JavaClassVersion = tuple[int, int]
@@ -172,26 +185,15 @@ class PuakmaServer:
 
     def get_last_log_items(self, limit_items: int = 10) -> list[LogItem]:
         limit_items = min(max(limit_items, 1), 50)
-        query = f"""\
-            SELECT *
-            FROM pmalog
-            WHERE type <> 'I'
-            ORDER BY logdate DESC
-            LIMIT {limit_items}
-        """
-        resp = self.database_designer.execute_query(self.puakma_db_conn_id, query)
+        query = _LOGS_QUERY % limit_items
         log_date_format = "%Y-%m-%d %H:%M:%S.%f"
-        logs = [
-            LogItem(
-                int(log["logid"]),
-                log["logstring"],
-                datetime.strptime(log["logdate"], log_date_format),
-                log["type"],
-                log["source"],
-                log["username"],
-            )
-            for log in resp
-        ]
+        resp = self.database_designer.execute_query(self.puakma_db_conn_id, query)
+        logs: list[LogItem] = []
+        for log in resp:
+            id_ = int(log["id"])
+            date = datetime.strptime(log["date"], log_date_format)
+            log_ = LogItem(id_, log["msg"], date, log["type"], log["src"], log["user"])
+            logs.append(log_)
         return logs
 
 
@@ -302,6 +304,8 @@ class DesignObject:
     app: PuakmaApplication
     is_jar_library: bool = False
     package_dir: Path | None = None
+    open_action: str | None = None
+    save_action: str | None = None
 
     @property
     def design_data(self) -> bytes:
@@ -368,7 +372,7 @@ class DesignObject:
         return f"'{self.name}' [{self.id}]"
 
 
-class DesignType(Enum):
+class DesignType(IntEnum):
     PAGE = 1
     RESOURCE = 2
     ACTION = 3
@@ -385,7 +389,7 @@ class DesignType(Enum):
     @classmethod
     def from_name(cls, name: str) -> DesignType:
         for member in cls:
-            if member.name == name:
+            if member.name.lower() == name.lower():
                 return cls(member.value)
         raise ValueError(f"'{name}' is not a valid DesignType")
 
@@ -423,6 +427,7 @@ class DesignPath:
         except ValueError:
             raise InvalidDesignPathError(f"Invalid path to a Design Object '{path}'")
 
+        self.workspace = workspace
         self.path = Path(path) if not isinstance(path, Path) else path
         self.rel_path = rel_path
         self.app_dir = app_dir
