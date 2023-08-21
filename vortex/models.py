@@ -7,6 +7,7 @@ import mimetypes
 import os
 import pickle
 from dataclasses import dataclass
+from dataclasses import field
 from datetime import datetime
 from enum import IntEnum
 from io import StringIO
@@ -101,12 +102,14 @@ class PuakmaServer:
         self.puakma_db_conn_id = puakma_db_conn_id
         self.username = username or input("Enter your Username: ")
         self.password = password or getpass.getpass("Enter your Password: ")
+
+        self._aclient = httpx.AsyncClient(auth=self.auth)
+        self._client = httpx.Client(auth=self.auth)
+
         self.app_designer = AppDesigner(self)
         self.database_designer = DatabaseDesigner(self)
         self.download_designer = DownloadDesigner(self)
         self.server_designer = ServerDesigner(self)
-        self._aclient = httpx.AsyncClient(auth=self.auth)
-        self._client = httpx.Client(auth=self.auth)
 
     @property
     def host(self) -> str:
@@ -293,19 +296,23 @@ class PuakmaApplication:
         return [obj for obj in self.design_objects if obj.name == design_name]
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, order=True)
 class DesignObject:
+    sort_index: str = field(init=False)
     id: int
     name: str
     design_type: DesignType
     content_type: str
-    _design_data: str
-    _design_source: str
+    _design_data: str = field(repr=False)
+    _design_source: str = field(repr=False)
     app: PuakmaApplication
     is_jar_library: bool = False
     package_dir: Path | None = None
     open_action: str | None = None
     save_action: str | None = None
+
+    def __post_init__(self) -> None:
+        self.sort_index = self.name.casefold()
 
     @property
     def design_data(self) -> bytes:
@@ -353,7 +360,7 @@ class DesignObject:
             workspace.path / self.app.dir_name / self.design_dir / self.file_name,
         )
 
-    async def upload(
+    async def aupload(
         self, download_designer: DownloadDesigner, upload_source: bool = False
     ) -> bool:
         data = self._design_source if upload_source else self._design_data

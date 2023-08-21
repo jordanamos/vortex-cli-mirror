@@ -16,6 +16,7 @@ import zlib
 from collections.abc import Generator
 from collections.abc import Sequence
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 
 from httpx import HTTPStatusError
@@ -45,6 +46,52 @@ logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("watchfiles").setLevel(logging.ERROR)
 
 logger = logging.getLogger("vortex")
+
+
+class Colour(Enum):
+    RED = "\033[41m"
+    BOLD = "\033[1m"
+    NORMAL = "\033[m"
+
+    @staticmethod
+    def highlight(text: str, colour: Colour, replace_in: str | None = None) -> str:
+        highlighted_txt = f"{colour.value}{text}{Colour.NORMAL.value}"
+        if replace_in:
+            highlighted_txt = replace_in.replace(text, highlighted_txt)
+        return highlighted_txt
+
+
+class WorkspaceFilter(BaseFilter):
+    ignore_files: tuple[str, ...] = (
+        ".DS_Store",
+        PuakmaApplication.PICKLE_FILE,
+    )
+
+    def __init__(self, workspace: Workspace, server: PuakmaServer) -> None:
+        self.workspace = workspace
+        self.server = server
+
+    def __call__(self, change: Change, _path: str) -> bool:
+        path = Path(_path)
+
+        _do_event = path.is_file() and (
+            change == Change.modified
+            or (change == Change.added and path.suffix == ".class")
+        )
+        if not _do_event or path.name in self.ignore_files:
+            return False
+        try:
+            design_path = DesignPath(self.workspace, path)
+            design_server_host = design_path.app.host
+            if design_server_host == self.server.host:
+                return True
+            else:
+                _warn_failed_upload(
+                    path, f"({design_server_host}) does not match ({self.server.host})"
+                )
+        except InvalidDesignPathError as e:
+            _warn_failed_upload(path, str(e))
+        return False
 
 
 def _check_class_file_version(
@@ -92,7 +139,7 @@ async def _upload_design(design_path: DesignPath, server: PuakmaServer) -> None:
     else:
         obj.design_data = file_bytes
 
-    ok = await obj.upload(server.download_designer, upload_source)
+    ok = await obj.aupload(server.download_designer, upload_source)
     _log_upload_status(ok, obj, upload_source)
 
 
@@ -106,53 +153,18 @@ def _warn_failed_upload(path: Path, err_msg: str) -> None:
     logger.warning(f"Failed to upload '{path.name}': {err_msg}")
 
 
-class WorkspaceFilter(BaseFilter):
-    ignore_files: tuple[str, ...] = (
-        ".DS_Store",
-        PuakmaApplication.PICKLE_FILE,
-    )
-
-    def __init__(self, workspace: Workspace, server: PuakmaServer) -> None:
-        self.workspace = workspace
-        self.server = server
-
-    def __call__(self, change: Change, _path: str) -> bool:
-        path = Path(_path)
-
-        _do_event = path.is_file() and (
-            change == Change.modified
-            or (change == Change.added and path.suffix == ".class")
-        )
-        if not _do_event or path.name in self.ignore_files:
-            return False
-        try:
-            design_path = DesignPath(self.workspace, path)
-            design_server_host = design_path.app.host
-            if design_server_host == self.server.host:
-                return True
-            else:
-                _warn_failed_upload(
-                    path, f"({design_server_host}) does not match ({self.server.host})"
-                )
-        except InvalidDesignPathError as e:
-            _warn_failed_upload(path, str(e))
-        return False
-
-
 async def _handle_changes(
     workspace: Workspace,
     server: PuakmaServer,
     changes: set[tuple[Change, str]],
 ) -> None:
     tasks = []
-    paths: list[DesignPath] = []
     for _, path in changes:
         design_path = DesignPath(workspace, path)
         tasks.append(asyncio.create_task(_upload_design(design_path, server)))
-        paths.append(design_path)
     try:
         await asyncio.gather(*tasks)
-        # Update the app diretories since some of the objects will have changes
+        # Update the app directories since some of the objects will have changed
         (workspace.mkdir(app) for app in workspace.listapps())
     except Exception as e:
         raise e
@@ -385,7 +397,6 @@ def list_apps(
     if show_local_only:
         apps = workspace.listapps()
     else:
-        apps = []
         with server as s:
             apps = s.fetch_all_apps(
                 name_filter,
@@ -491,25 +502,27 @@ def find(
     name: str,
     *,
     app_ids: list[int] | None = None,
-    design_type: str | None = None,
+    design_types: list[DesignType] | None = None,
     show_headers: bool = True,
+    exclude_resources: bool = True,
 ) -> int:
     row = "{:<6} {:<20} {:<16} {:<30} {:<30} {:<30}"
     row_headers = ("ID", "Application", "Type", "Name", "Open Action", "Save Action")
     if show_headers:
         print(row.format(*row_headers))
 
-    apps = [app for app in workspace.listapps() if (not app_ids or app.id in app_ids)]
-    name = name.lower()
-    matches = (
+    apps = (app for app in workspace.listapps() if (not app_ids or app.id in app_ids))
+    if exclude_resources:
+        design_types = [t for t in DesignType if t != DesignType.RESOURCE]
+    matches = [
         obj
         for app in apps
         for obj in app.design_objects
-        if name in obj.name.lower()
-        and (not design_type or obj.design_type == DesignType.from_name(design_type))
-    )
+        if name.lower() in obj.name.lower()
+        and (not design_types or obj.design_type in design_types)
+    ]
 
-    for obj in matches:
+    for obj in sorted(matches):
         oa = obj.open_action or ""
         sa = obj.save_action or ""
         print(row.format(obj.id, obj.app.name, obj.design_type.name, obj.name, oa, sa))
@@ -521,29 +534,39 @@ def grep(
     pattern: str,
     *,
     app_ids: list[int] | None = None,
-    design_type: str | None = None,
+    design_types: list[DesignType] | None = None,
     output_paths: bool = False,
+    exclude_resources: bool = True,
 ) -> int:
     def _output_match(match: re.Match[bytes]) -> None:
-        line_indx = match.string.count(b"\n", 0, match.start())
+        try:
+            text = match.string.decode()
+        except UnicodeDecodeError:
+            # Found a binary resource or jar library etc., skip
+            return
+        line_indx = text.count("\n", 0, match.start())
         line_no = line_indx + 1
         if output_paths:
             print(f"{obj.design_path(workspace)}:{line_no}")
         else:
             matched_text = match.group().decode()
-            line = match.string.splitlines()[line_indx].decode().strip()
-            new_line = util.colour(matched_text, util.Colour.RED, line)
-            print(f"{util.colour(obj.name, util.Colour.BOLD)}:{line_no}:{new_line}")
+            line = text.splitlines()[line_indx].strip()
+            new_line = Colour.highlight(matched_text, Colour.RED, line)
+            print(f"{Colour.highlight(obj.name, Colour.BOLD)}:{line_no}:{new_line}")
+
+    if exclude_resources:
+        design_types = [t for t in DesignType if t != DesignType.RESOURCE]
 
     regex = re.compile(pattern.encode())
-    apps = [app for app in workspace.listapps() if (not app_ids or app.id in app_ids)]
+    apps = (app for app in workspace.listapps() if (not app_ids or app.id in app_ids))
     objs = [
         obj
         for app in apps
         for obj in app.design_objects
-        if (not design_type or obj.design_type == DesignType.from_name(design_type))
+        if (not obj.is_jar_library)
+        and (not design_types or obj.design_type in design_types)
     ]
-    for obj in objs:
+    for obj in sorted(objs):
         bytes_to_search = obj.design_source if obj.do_save_source else obj.design_data
         match = re.search(regex, bytes_to_search)
         _output_match(match) if match else None
@@ -593,13 +616,18 @@ def _add_no_headers_option(*parsers: argparse.ArgumentParser) -> None:
         )
 
 
-def _add_design_type_option(*parsers: argparse.ArgumentParser) -> None:
+def _add_design_type_option(
+    *parsers: argparse.ArgumentParser | argparse._MutuallyExclusiveGroup,
+) -> None:
+    choices = ", ".join([f"'{t.name.lower()}'" for t in DesignType])
     for p in parsers:
         p.add_argument(
             "--type",
             "-t",
-            choices=[m.lower() for m in DesignType._member_names_],
+            nargs="*",
             dest="design_type",
+            type=DesignType.from_name,
+            help=f"(choose from {choices})",
         )
 
 
@@ -620,13 +648,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     list_parser = command_parser.add_parser(
         "list",
         aliases=("ls",),
-        help="List Puakma Applications on the server or cloned locally",
+        help=(
+            "List Puakma Applications on the server or cloned locally."
+            "(ls is an alias for 'vortex list --local')"
+        ),
     )
     list_parser.add_argument(
         "--group",
         "-g",
         nargs="*",
-        help="Enter an application 'group' substrings to filter the results",
+        help="Enter application 'group' substrings to filter the results",
     )
     list_parser.add_argument(
         "--name",
@@ -675,7 +706,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     clone_parser = command_parser.add_parser(
         "clone",
-        help="Clone a Puakma Application and it's design objects into the workspace",
+        help="Clone Puakma Applications and their design objects into the workspace",
     )
     clone_parser.add_argument(
         "app_ids",
@@ -706,7 +737,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     watch_parser = command_parser.add_parser(
         "watch",
         help=(
-            "Watch the workspace for changes to design objects "
+            "Watch the workspace for changes to Design Objects "
             "and upload them to the server"
         ),
     )
@@ -719,6 +750,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     config_parser = command_parser.add_parser(
         "config", help="View and manage configuration"
     )
+    # TODO These could probably be a mutexgroup
     config_parser.add_argument(
         "--sample",
         dest="print_sample",
@@ -775,21 +807,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         "name", help="The name substring of Design Objects to find"
     )
     find_parser.add_argument("--app-id", type=int, nargs="*", dest="app_ids")
+    find_design_type_mutex = find_parser.add_mutually_exclusive_group()
+    find_design_type_mutex.add_argument("--exclude-resources", action="store_true")
 
     grep_parser = command_parser.add_parser(
         "grep",
-        help="Search the contents of design objects using regular expressions",
+        help=(
+            "Search the contents of cloned Design Objects using a Regular Expression."
+        ),
         usage="%(prog)s [options] pattern",
     )
     grep_parser.add_argument("pattern", help="The Regular Expression pattern to match")
     grep_parser.add_argument("--app-id", type=int, nargs="*", dest="app_ids")
     grep_parser.add_argument("--output-paths", action="store_true")
+    grep_design_type_mutex = grep_parser.add_mutually_exclusive_group()
+    grep_design_type_mutex.add_argument("--exclude-resources", action="store_true")
 
     _server_debug_parsers = (list_parser, clone_parser, watch_parser, log_parser)
     _add_server_option(*_server_debug_parsers, config_parser)
     _add_debug_option(*_server_debug_parsers)
     _add_no_headers_option(list_parser, log_parser, find_parser)
-    _add_design_type_option(find_parser, grep_parser)
+    _add_design_type_option(find_design_type_mutex, grep_design_type_mutex)
 
     args, remaining_args = parser.parse_known_args(argv)
 
@@ -867,16 +905,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 workspace,
                 args.name,
                 app_ids=args.app_ids,
-                design_type=args.design_type,
+                design_types=args.design_type,
                 show_headers=args.show_headers,
+                exclude_resources=args.exclude_resources,
             )
         elif args.command == "grep":
             return grep(
                 workspace,
                 args.pattern,
                 app_ids=args.app_ids,
-                design_type=args.design_type,
+                design_types=args.design_type,
                 output_paths=args.output_paths,
+                exclude_resources=args.exclude_resources,
             )
         elif args.command:
             raise NotImplementedError(f"Command '{args.command}' is not implemented.")
