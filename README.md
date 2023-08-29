@@ -4,6 +4,10 @@ Vortex CLI is a command line alternative to the [Puakma Vortex IDE](https://gith
 
 Vortex CLI also comes pre-packaged with the necessary Puakma .jar files for development.
 
+#### Visual Studio Code and Extensions
+
+While it is possible to use without it, this software has been purposefully designed for use with [Visual Studio Code](https://github.com/microsoft/vscode) and the [Project Manager For Java](https://marketplace.visualstudio.com/items?itemName=vscjava.vscode-java-dependency) or the [Extension Pack For Java](https://marketplace.visualstudio.com/items?itemName=vscjava.vscode-java-pack) extension. This software leverages [Workspaces](https://code.visualstudio.com/docs/editor/workspaces) in Visual Studio Code and manages a `vortex.code-workspace` file within the workspace.
+
 ## Installation
 
 1. Install the tool using pip.
@@ -13,6 +17,8 @@ Vortex CLI also comes pre-packaged with the necessary Puakma .jar files for deve
    ```
 
 2. It is recommended to set the workspace you would like to work out of via the `VORTEX_WORKSPACE` environment variable.
+
+   On Unix:
 
    ```
    export VORTEX_WORKSPACE=/path/to/workspace
@@ -54,6 +60,17 @@ Vortex CLI also comes pre-packaged with the necessary Puakma .jar files for deve
    puakma_db_conn_id = 13
    username = myuser ; Optional
    password = mypassword ; Optional
+   ```
+
+4. Setup the [Visual Studio Code Workspace](https://code.visualstudio.com/docs/editor/workspaces) to use the same Java version as your server in /path/to/workspace/.vscode/vortex.code-workspace under "settings", for example:
+   ```
+   "java.configuration.runtimes": [
+      {
+         "default": true,
+         "name": "JavaSE-1.8",
+         "path": "/Library/Java/JavaVirtualMachines/temurin-8.jdk/Contents/Home"
+      }
+   ]
    ```
 
 ## Usage
@@ -102,4 +119,38 @@ To delete the locally cloned Puakma Application directories in the workspace, us
 
 ```
 vortex clean
+```
+
+### Create Design Objects
+
+To create new design objects, use the `new` command:
+
+```
+vortex new [NAME, ...] --app-id <app_id> --type <design_type>
+```
+
+Specify more than one name to create multiple design objects of the same type for the specified application
+
+### Delete Design Objects
+
+To delete a design object, use the `delete` command:
+
+```
+vortex delete [DESIGN_OBJECT_ID, ...]
+```
+
+### Find cloned Design Objects
+
+To search for Design Objects by name use the `find` command:
+
+```
+vortex find <name> [options]
+```
+
+### Search the contents of cloned Design Objects
+
+To search for text patterns in Design Objects using a [Regular Expression](https://learn.microsoft.com/en-us/dotnet/standard/base-types/regular-expression-language-quick-reference) use the `grep` command:
+
+```
+vortex grep <pattern> [options]
 ```

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import binascii
 import concurrent.futures
 import contextlib
 import functools
 import logging
+import mimetypes
 import re
 import shutil
 import textwrap
@@ -16,26 +18,20 @@ import zlib
 from collections.abc import Generator
 from collections.abc import Sequence
 from datetime import datetime
-from enum import Enum
 from pathlib import Path
 
 from httpx import HTTPStatusError
-from watchfiles import awatch
-from watchfiles import BaseFilter
-from watchfiles import Change
 
 from vortex import util
 from vortex.models import DesignObject
-from vortex.models import DesignPath
 from vortex.models import DesignType
-from vortex.models import InvalidDesignPathError
 from vortex.models import JavaClassVersion
 from vortex.models import PuakmaApplication
 from vortex.models import PuakmaServer
+from vortex.watcher import WorkspaceWatcher
 from vortex.workspace import SAMPLE_CONFIG
-from vortex.workspace import ServerConfigError
 from vortex.workspace import Workspace
-from vortex.workspace import WorkspaceInUseError
+from vortex.workspace import WorkspaceError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,172 +44,16 @@ logging.getLogger("watchfiles").setLevel(logging.ERROR)
 logger = logging.getLogger("vortex")
 
 
-class Colour(Enum):
-    RED = "\033[41m"
-    BOLD = "\033[1m"
-    NORMAL = "\033[m"
-
-    @staticmethod
-    def highlight(text: str, colour: Colour, replace_in: str | None = None) -> str:
-        highlighted_txt = f"{colour.value}{text}{Colour.NORMAL.value}"
-        if replace_in:
-            highlighted_txt = replace_in.replace(text, highlighted_txt)
-        return highlighted_txt
-
-
-class WorkspaceFilter(BaseFilter):
-    ignore_files: tuple[str, ...] = (
-        ".DS_Store",
-        PuakmaApplication.PICKLE_FILE,
-    )
-
-    def __init__(self, workspace: Workspace, server: PuakmaServer) -> None:
-        self.workspace = workspace
-        self.server = server
-
-    def __call__(self, change: Change, _path: str) -> bool:
-        path = Path(_path)
-
-        _do_event = path.is_file() and (
-            change == Change.modified
-            or (change == Change.added and path.suffix == ".class")
-        )
-        if not _do_event or path.name in self.ignore_files:
-            return False
-        try:
-            design_path = DesignPath(self.workspace, path)
-            design_server_host = design_path.app.host
-            if design_server_host == self.server.host:
-                return True
-            else:
-                _warn_failed_upload(
-                    path, f"({design_server_host}) does not match ({self.server.host})"
-                )
-        except InvalidDesignPathError as e:
-            _warn_failed_upload(path, str(e))
-        return False
-
-
-def _check_class_file_version(
-    class_file_bytes: bytes, expected_version: JavaClassVersion
-) -> tuple[bool, str]:
-    # https://en.wikipedia.org/wiki/Java_class_file#General_layout
-    bytes_header = class_file_bytes[:8]
-    if bytes_header[:4] != b"\xca\xfe\xba\xbe":
-        return False, "Not a valid Java Class File"
-    major_version = int.from_bytes(bytes_header[6:8], byteorder="big")
-    minor_version = int.from_bytes(bytes_header[4:6], byteorder="big")
-    compiled_version: JavaClassVersion = (major_version, minor_version)
-    if compiled_version != expected_version:
-        return (
-            False,
-            f"File has been compiled with Java Class Version"
-            f"{compiled_version} but expected {expected_version}",
-        )
-    return True, ""
-
-
-async def _upload_design(design_path: DesignPath, server: PuakmaServer) -> None:
-    app = design_path.app
-    try:
-        file_bytes = await asyncio.to_thread(design_path.path.read_bytes)
-    except OSError as e:
-        _warn_failed_upload(design_path.path, e.strerror)
-        return
-    # If we are uploading a class file, lets verify if it has been compiled correctly
-    if design_path.file_ext == ".class" and app.java_class_version:
-        is_valid, msg = _check_class_file_version(file_bytes, app.java_class_version)
-        if not is_valid:
-            _warn_failed_upload(design_path.path, msg)
-            return
-
-    objs = app.lookup_design_obj(design_path.design_name)
-    if len(objs) != 1:
-        _warn_failed_upload(design_path.path, f"Too many or no matches {objs}")
-        return
-
-    obj = objs.pop()
-    upload_source = design_path.file_ext == ".java"
-    if upload_source:
-        obj.design_source = file_bytes
-    else:
-        obj.design_data = file_bytes
-
-    ok = await obj.aupload(server.download_designer, upload_source)
-    _log_upload_status(ok, obj, upload_source)
-
-
-def _log_upload_status(status_ok: bool, obj: DesignObject, do_source: bool) -> None:
-    upload_type = "SOURCE" if do_source else "DATA"
-    ok, level = ("OK", logging.INFO) if status_ok else ("ERROR", logging.ERROR)
-    logger.log(level, f"Upload {upload_type} of Design Object {obj}: {ok}")
-
-
-def _warn_failed_upload(path: Path, err_msg: str) -> None:
-    logger.warning(f"Failed to upload '{path.name}': {err_msg}")
-
-
-async def _handle_changes(
-    workspace: Workspace,
-    server: PuakmaServer,
-    changes: set[tuple[Change, str]],
-) -> None:
-    tasks = []
-    for _, path in changes:
-        design_path = DesignPath(workspace, path)
-        tasks.append(asyncio.create_task(_upload_design(design_path, server)))
-    try:
-        await asyncio.gather(*tasks)
-        # Update the app directories since some of the objects will have changed
-        (workspace.mkdir(app) for app in workspace.listapps())
-    except Exception as e:
-        raise e
-
-
-async def _watch_for_changes(workspace: Workspace, server: PuakmaServer) -> int:
-    async def _gather_changes(_changes: set[tuple[Change, str]]) -> bool:
-        try:
-            await asyncio.gather(_handle_changes(workspace, server, _changes))
-        except Exception as e:
-            logger.critical(e)
-            return True
-        return False
-
-    _error = False
-    async with server as s:
-        try:
-            msg = await s.server_designer.ainitiate_connection()
-            logger.info(msg.strip())
-        except Exception as e:
-            logger.critical(e)
-            return 1
-
-        _filter = WorkspaceFilter(workspace, server)
-        changes = None
-        while True:
-            try:
-                async for changes in awatch(*workspace.listdir(), watch_filter=_filter):
-                    _error = await _gather_changes(changes)
-                    if _error:
-                        break
-            except Exception as e:
-                logger.error(e)
-                if changes:
-                    _error = await _gather_changes(changes)
-            if _error:
-                break
-    return 1 if _error else 0
-
-
 def watch(workspace: Workspace, server: PuakmaServer) -> int:
     if not workspace.listdir():
         logger.error(f"No application directories to watch in workspace '{workspace}'")
         return 1
     with (
         workspace.exclusive_lock(),
-        util.spinner("Watching workspace, ^C to stop"),
+        util.Spinner("Watching workspace, ^C to stop") as spinner,
     ):
-        return asyncio.run(_watch_for_changes(workspace, server))
+        watcher = WorkspaceWatcher(workspace, server, spinner)
+        return asyncio.run(watcher.watch())
 
 
 def fetch_and_parse_app_xml(
@@ -299,7 +139,7 @@ def clone(
     eles = app_ele.findall("designElement", namespaces=None)
 
     match_and_validate_design_objs(objs, eles)
-    app.design_objects = tuple(objs)
+    app.design_objects = objs
     app_dir = workspace.mkdir(app, True)
 
     # TODO: This doesn't catch KeyboardInterupt
@@ -332,15 +172,18 @@ def clone_apps(
     server: PuakmaServer,
     app_ids: list[int],
     *,
-    get_resources: bool,
-    open_urls: bool,
+    get_resources: bool = False,
+    open_urls: bool = False,
+    reclone: bool = False,
 ) -> int:
-    with workspace.exclusive_lock():
+    if reclone:
+        app_ids.extend(app.id for app in workspace.listapps())
+
+    with workspace.exclusive_lock(), util.Spinner(f"Cloning {app_ids}..."):
         fn = functools.partial(clone, workspace, server, get_resources=get_resources)
         todo = [id for id in set(app_ids)]
         with (
             server,
-            util.spinner(f"Cloning {app_ids}..."),
             concurrent.futures.ThreadPoolExecutor() as ex,
         ):
             results = ex.map(fn, todo)
@@ -497,6 +340,30 @@ def log(server: PuakmaServer, limit: int, *, show_headers: bool = True) -> int:
     return 0
 
 
+def _render_objects(
+    objs: list[DesignObject], *, show_headers: bool = True, show_actions: bool = False
+) -> None:
+    row = "{:<6}{:<30}{:^16}{:^25}"
+    row_headers = ["ID", "Name", "Type", "Application"]
+
+    if show_actions:
+        row = "{:<6}{:<30}{:^16}{:^25}{:<30} {:<30}"
+        row_headers.append("Open Action")
+        row_headers.append("Save Action")
+
+    if show_headers:
+        print(row.format(*row_headers))
+
+    for obj in sorted(objs):
+        row_data = [obj.id, obj.name, obj.design_type.name, obj.app.name]
+        if show_actions:
+            oa = obj.open_action or ""
+            sa = obj.save_action or ""
+            row_data.append(oa)
+            row_data.append(sa)
+        print(row.format(*row_data))
+
+
 def find(
     workspace: Workspace,
     name: str,
@@ -505,12 +372,9 @@ def find(
     design_types: list[DesignType] | None = None,
     show_headers: bool = True,
     exclude_resources: bool = True,
+    show_actions: bool = False,
+    show_ids_only: bool = False,
 ) -> int:
-    row = "{:<6} {:<20} {:<16} {:<30} {:<30} {:<30}"
-    row_headers = ("ID", "Application", "Type", "Name", "Open Action", "Save Action")
-    if show_headers:
-        print(row.format(*row_headers))
-
     apps = (app for app in workspace.listapps() if (not app_ids or app.id in app_ids))
     if exclude_resources:
         design_types = [t for t in DesignType if t != DesignType.RESOURCE]
@@ -522,10 +386,12 @@ def find(
         and (not design_types or obj.design_type in design_types)
     ]
 
-    for obj in sorted(matches):
-        oa = obj.open_action or ""
-        sa = obj.save_action or ""
-        print(row.format(obj.id, obj.app.name, obj.design_type.name, obj.name, oa, sa))
+    if show_ids_only:
+        for obj in matches:
+            print(obj.id)
+    else:
+        _render_objects(matches, show_headers=show_headers, show_actions=show_actions)
+
     return 0
 
 
@@ -551,8 +417,11 @@ def grep(
         else:
             matched_text = match.group().decode()
             line = text.splitlines()[line_indx].strip()
-            new_line = Colour.highlight(matched_text, Colour.RED, line)
-            print(f"{Colour.highlight(obj.name, Colour.BOLD)}:{line_no}:{new_line}")
+            new_text = util.Colour.highlight(matched_text, util.Colour.RED, line)
+            print(
+                f"{util.Colour.highlight(obj.name, util.Colour.BOLD)}"
+                f":{line_no}:{new_text}"
+            )
 
     if exclude_resources:
         design_types = [t for t in DesignType if t != DesignType.RESOURCE]
@@ -573,17 +442,147 @@ def grep(
     return 0
 
 
+def _create_obj(workspace: Workspace, server: PuakmaServer, obj: DesignObject) -> int:
+    ok = server.app_designer.update_design_object(obj) > 0
+    logger.info(f"Created Design Object {obj}: {('OK' if ok else 'ERROR')}")
+    if ok:
+        obj.save(workspace)
+        obj.app.design_objects.append(obj)
+        workspace.mkdir(obj.app)
+        logger.info(f"Successfully saved {obj}")
+    return 0 if ok else 1
+
+
+def new(
+    workspace: Workspace,
+    server: PuakmaServer,
+    names: list[str],
+    app_id: int,
+    design_type: DesignType,
+    content_type: str | None = None,
+    comment: str = "",
+    inherit_from: str = "",
+) -> int:
+    apps = [app for app in workspace.listapps() if app.id == app_id]
+    if not apps:
+        logger.error(f"No cloned application found with ID {app_id}")
+        return 1
+
+    if design_type.is_java_type:
+        content_type = "application/java"
+    elif design_type == DesignType.PAGE:
+        content_type = "text/html"
+    _ext = mimetypes.guess_extension(content_type) if content_type else None
+    if _ext is None or content_type is None:
+        logger.error(f"Unable to determine file type for '{content_type}'")
+        return 1
+
+    app = apps.pop()
+    objs: list[DesignObject] = []
+    for name in names:
+        existing_objs = app.lookup_design_obj(name)
+        if existing_objs:
+            logger.error(
+                f"Design Object {[*existing_objs.values()][0]} already exists in {app}"
+            )
+            continue
+        design_source = base64.b64encode(
+            (design_type.source_template(name)).encode()
+        ).decode()
+        objs.append(
+            DesignObject(
+                -1,
+                name,
+                design_type,
+                content_type,
+                "",
+                design_source,
+                app,
+                comment=comment,
+                inherit_from=inherit_from,
+            )
+        )
+    if not objs:
+        return 1
+
+    print("The following Design Objects will be created:\n")
+    _render_objects(objs)
+    if input("\n[Y/y] to continue:") not in ["Y", "y"]:
+        return 1
+
+    fn = functools.partial(_create_obj, workspace, server)
+    with workspace.exclusive_lock(), (
+        server
+    ), concurrent.futures.ThreadPoolExecutor() as ex:
+        results = ex.map(fn, objs)
+
+    ret = 0
+    for result in results:
+        ret |= result
+    return ret
+
+
+def _delete_obj(workspace: Workspace, server: PuakmaServer, obj: DesignObject) -> int:
+    server.app_designer.remove_design_object(obj.id)
+    obj.app.design_objects.remove(obj)
+    logger.info(f"Deleted Design Object: {obj}")
+    path = obj.design_path(workspace).path
+    if path.exists():
+        path.unlink()
+        logger.info(f"Deleted Local File: {path}")
+    else:
+        err = (
+            f"Unable to delete local file because it does not exist: {path}\n"
+            "Hint: It may have already been deleted or saved without file extension."
+        )
+        logger.warning(err)
+    workspace.mkdir(obj.app)
+    return 0
+
+
+def delete(
+    workspace: Workspace,
+    server: PuakmaServer,
+    obj_ids: list[int],
+) -> int:
+    objs = []
+    for app in workspace.listapps():
+        objs.extend([obj for obj in app.design_objects if obj.id in obj_ids])
+
+    if not objs:
+        logger.error(f"No cloned Design Object found with ID {obj_ids}")
+        return 1
+
+    _deleted = util.Colour.highlight("deleted", util.Colour.RED)
+    print(f"The following Design Objects will be {_deleted}:\n")
+    _render_objects(objs)
+    if input("\n[Y/y] to continue:") not in ["Y", "y"]:
+        return 1
+
+    fn = functools.partial(_delete_obj, workspace, server)
+    with (
+        workspace.exclusive_lock(),
+        server,
+        concurrent.futures.ThreadPoolExecutor() as ex,
+    ):
+        results = ex.map(fn, objs)
+    ret = 0
+    for result in results:
+        ret |= result
+    return ret
+
+
 @contextlib.contextmanager
-def error_handler(with_tb: bool = True) -> Generator[None, None, None]:
+def error_handler() -> Generator[None, None, None]:
     try:
         yield
-    except (WorkspaceInUseError, ServerConfigError, HTTPStatusError) as e:
+    except (WorkspaceError, HTTPStatusError) as e:
         logger.error(e)
         raise SystemExit(1)
     except KeyboardInterrupt:
         raise SystemExit(130)
     except BaseException as e:
-        logger.critical(e, stack_info=with_tb, exc_info=with_tb)
+        logger.critical(e, stack_info=True, exc_info=True)
         raise SystemExit(1)
 
 
@@ -594,15 +593,6 @@ def _add_server_option(*parsers: argparse.ArgumentParser) -> None:
             "-s",
             metavar="NAME",
             help="Enter the name of the server definition in the config file to use",
-        )
-
-
-def _add_debug_option(*parsers: argparse.ArgumentParser) -> None:
-    for p in parsers:
-        p.add_argument(
-            "--debug",
-            help="Set this flag to see DEBUG messages",
-            action="store_true",
         )
 
 
@@ -619,7 +609,6 @@ def _add_no_headers_option(*parsers: argparse.ArgumentParser) -> None:
 def _add_design_type_option(
     *parsers: argparse.ArgumentParser | argparse._MutuallyExclusiveGroup,
 ) -> None:
-    choices = ", ".join([f"'{t.name.lower()}'" for t in DesignType])
     for p in parsers:
         p.add_argument(
             "--type",
@@ -627,20 +616,27 @@ def _add_design_type_option(
             nargs="*",
             dest="design_type",
             type=DesignType.from_name,
-            help=f"(choose from {choices})",
+            metavar="DESIGN_TYPE",
+            help=(f"Choices: {[t.name.lower() for t in DesignType]}"),
         )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Vortex command line tool")
     parser.add_argument(
-        "--version", action="version", version=f"vortex-cli {util.VERSION}"
+        "--version", "-V", action="version", version=f"vortex-cli {util.VERSION}"
     )
     parser.add_argument(
         "--workspace",
         "-w",
         metavar="DIR",
         help="Override the Workspace directory path",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        help="Set this flag to see DEBUG messages",
+        action="store_true",
     )
 
     command_parser = parser.add_subparsers(dest="command")
@@ -710,7 +706,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     clone_parser.add_argument(
         "app_ids",
-        nargs="+",
+        nargs="*",
         metavar="APP_ID",
         help="The ID(s) of the Puakma Application(s) to clone",
         type=int,
@@ -725,6 +721,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--open-urls",
         "-o",
         help="Set this flag to open the application and webdesign URLs after cloning",
+        action="store_true",
+    )
+    clone_parser.add_argument(
+        "--reclone",
+        help="Set this flag to reclone the already locally cloned applictions",
         action="store_true",
     )
     code_parser = command_parser.add_parser(
@@ -782,7 +783,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help=(
             "Creates the workspace directory and a sample "
-            "'vortex-server-config.ini' file, if they don't already exist"
+            f"'{Workspace.CONFIG_FILE_NAME}' file, if they don't already exist"
         ),
     )
 
@@ -803,10 +804,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Find Design Objects of cloned applications by name",
         usage="%(prog)s [options] name",
     )
-    find_parser.add_argument(
-        "name", help="The name substring of Design Objects to find"
-    )
+    find_parser.add_argument("name", help="The name of Design Objects to find")
     find_parser.add_argument("--app-id", type=int, nargs="*", dest="app_ids")
+    find_parser.add_argument(
+        "--ids-only",
+        "-x",
+        help="Set this flag to only display the ID's of the objects in the output",
+        dest="show_ids_only",
+        action="store_true",
+    )
+    find_parser.add_argument(
+        "--show-actions",
+        help="Set this flag to also display the Open and Save Actions of each object",
+        action="store_true",
+    )
     find_design_type_mutex = find_parser.add_mutually_exclusive_group()
     find_design_type_mutex.add_argument("--exclude-resources", action="store_true")
 
@@ -823,37 +834,69 @@ def main(argv: Sequence[str] | None = None) -> int:
     grep_design_type_mutex = grep_parser.add_mutually_exclusive_group()
     grep_design_type_mutex.add_argument("--exclude-resources", action="store_true")
 
-    _server_debug_parsers = (list_parser, clone_parser, watch_parser, log_parser)
-    _add_server_option(*_server_debug_parsers, config_parser)
-    _add_debug_option(*_server_debug_parsers)
+    new_parser = command_parser.add_parser("new", help="Create new Design Object(s)")
+    new_parser.add_argument("names", nargs="+")
+    new_parser.add_argument("--app-id", type=int, required=True)
+    new_parser.add_argument("--comment", "-c")
+    new_parser.add_argument("--inherit-from")
+    new_parser.add_argument(
+        "--type",
+        "-t",
+        dest="design_type",
+        type=DesignType.from_name,
+        metavar=f"[{', '.join([t.name.lower() for t in DesignType])}]",
+        required=True,
+    )
+    new_parser.add_argument(
+        "--content-type", help="The MIME Type. Only used when creating a 'resource'."
+    )
+
+    delete_parser = command_parser.add_parser(
+        "delete", help="Delete Design Object(s) by ID"
+    )
+    delete_parser.add_argument(
+        "obj_ids", nargs="+", type=int, metavar="DESIGN_OBJECT_ID"
+    )
+
+    SERVER_COMMANDS = ("list", "ls", "clone", "watch", "log", "new", "delete")
+    _server_parsers = (
+        list_parser,
+        clone_parser,
+        watch_parser,
+        log_parser,
+        new_parser,
+        delete_parser,
+    )
+    _add_server_option(*_server_parsers, config_parser)
     _add_no_headers_option(list_parser, log_parser, find_parser)
     _add_design_type_option(find_design_type_mutex, grep_design_type_mutex)
 
+    # Validate Arguments
     args, remaining_args = parser.parse_known_args(argv)
-
     if args.command != "code":
-        # Call this for validation
-        parser.parse_args(argv)
+        parser.parse_args(argv)  # Call this for validation
+    if args.command == "new" and (
+        args.design_type == DesignType.RESOURCE and not args.content_type
+    ):
+        new_parser.error("--type argument value 'resource' requires --content-type")
+    if args.command == "clone" and not (args.app_ids or args.reclone):
+        clone_parser.error("Please specifiy the APP_ID[s] to clone or use --reclone")
+
+    # Configure loggers
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+        logging.getLogger("httpx").setLevel(logging.DEBUG)
+        logging.getLogger("watchfiles").setLevel(logging.INFO)
 
     with error_handler():
         workspace_path = getattr(args, "workspace", None)
         server_name = getattr(args, "server", None)
-        try:
-            do_init = args.command == "config" and args.init
-            workspace = Workspace(workspace_path, do_init)
-        except NotADirectoryError:
-            logger.error(
-                f"Workspace {workspace_path} does not exist. "
-                "Hint: You can create it with 'vortex config --init'."
-            )
-            return 1
+        init = args.command == "config" and args.init
+        workspace = Workspace(workspace_path, init)
 
-        if args.command in ["list", "ls", "clone", "watch", "log"]:
+        if args.command in SERVER_COMMANDS:
             server = workspace.read_server_from_config(server_name)
-            if args.debug:
-                logger.setLevel(logging.DEBUG)
-                logging.getLogger("httpx").setLevel(logging.DEBUG)
-                logging.getLogger("watchfiles").setLevel(logging.INFO)
+
             if args.command in ("list", "ls"):
                 local_only = args.show_local_only or args.command == "ls"
                 return list_apps(
@@ -876,11 +919,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.app_ids,
                     get_resources=args.get_resources,
                     open_urls=args.open_urls,
+                    reclone=args.reclone,
                 )
             elif args.command == "watch":
                 return watch(workspace, server)
             elif args.command == "log":
                 return log(server, args.limit, show_headers=args.show_headers)
+            elif args.command == "new":
+                return new(
+                    workspace,
+                    server,
+                    app_id=args.app_id,
+                    names=args.names,
+                    design_type=args.design_type,
+                    content_type=args.content_type,
+                    comment=args.comment,
+                    inherit_from=args.inherit_from,
+                )
+            elif args.command == "delete":
+                return delete(workspace, server, args.obj_ids)
         elif args.command == "clean":
             return clean(workspace)
         elif args.command == "code":
@@ -906,8 +963,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.name,
                 app_ids=args.app_ids,
                 design_types=args.design_type,
-                show_headers=args.show_headers,
                 exclude_resources=args.exclude_resources,
+                show_actions=args.show_actions,
+                show_ids_only=args.show_ids_only,
             )
         elif args.command == "grep":
             return grep(

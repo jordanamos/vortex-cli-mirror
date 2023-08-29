@@ -38,6 +38,7 @@ _JAVA_MIME_TYPES = (
     "application/octet-stream",
     "application/javavm",
 )
+
 _DESIGN_OBJECT_QUERY = """\
 SELECT designbucketid AS id
     , name
@@ -72,6 +73,23 @@ FROM pmalog
 WHERE type <> 'I'
 ORDER BY logdate DESC
 LIMIT % d
+"""
+
+_ACTION_TEMPLATE = """\
+import puakma.system.ActionRunner;
+
+public class %s extends ActionRunner {
+
+    public String execute() {
+        return "";
+    }
+}
+"""
+
+_SHARED_CODE_TEMPLATE = """\
+public class %s {
+
+}
 """
 
 JavaClassVersion = tuple[int, int]
@@ -220,7 +238,7 @@ class PuakmaApplication:
         self.template_name = template_name
         self.host = host
         self.java_class_version = java_class_version
-        self._design_objects: tuple[DesignObject, ...] = tuple()
+        self.design_objects: list[DesignObject] = []
 
     @property
     def dir_name(self) -> str:
@@ -235,25 +253,17 @@ class PuakmaApplication:
         base_url = f"http://{self.host}/system/webdesign.pma"
         return f"{base_url}/DesignList?OpenPage&AppID={self.id}"
 
-    @property
-    def design_objects(self) -> tuple[DesignObject, ...]:
-        return self._design_objects
-
-    @design_objects.setter
-    def design_objects(self, value: tuple[DesignObject]) -> None:
-        self._design_objects = tuple(value)
-
     def __str__(self) -> str:
         return f"{self.group}/{self.name}"
 
     @classmethod
-    def from_dir(cls, path: Path | str) -> PuakmaApplication:
+    def from_dir(cls, path: Path) -> PuakmaApplication:
         """
         Returns an instance of this class from the .PuakmaApplication.pickle file
         within the given directory.
         Raises ValueError if unsuccessful
         """
-        app_file = os.path.join(path, cls.PICKLE_FILE)
+        app_file = path / cls.PICKLE_FILE
         try:
             with open(app_file, "rb") as f:
                 app = pickle.load(f)
@@ -292,8 +302,13 @@ class PuakmaApplication:
             )
         return objs
 
-    def lookup_design_obj(self, design_name: str) -> list[DesignObject]:
-        return [obj for obj in self.design_objects if obj.name == design_name]
+    def lookup_design_obj(self, design_name: str) -> dict[int, DesignObject]:
+        """Returns {index: obj} for each match in the design_objects list"""
+        return {
+            i: obj
+            for i, obj in enumerate(self.design_objects)
+            if obj.name == design_name
+        }
 
 
 @dataclass(slots=True, order=True)
@@ -310,6 +325,8 @@ class DesignObject:
     package_dir: Path | None = None
     open_action: str | None = None
     save_action: str | None = None
+    comment: str | None = None
+    inherit_from: str | None = None
 
     def __post_init__(self) -> None:
         self.sort_index = self.name.casefold()
@@ -393,6 +410,12 @@ class DesignType(IntEnum):
     def is_java_type(self) -> bool:
         return self in self.java_types()
 
+    def source_template(self, name: str) -> str:
+        ret = (_ACTION_TEMPLATE % name) if self.is_java_type else ""
+        if self == DesignType.SHARED_CODE:
+            ret = _SHARED_CODE_TEMPLATE % name
+        return ret
+
     @classmethod
     def from_name(cls, name: str) -> DesignType:
         for member in cls:
@@ -425,22 +448,21 @@ class DesignPath:
     otherwise a InvalidDesignPathError is raised
     """
 
-    def __init__(self, workspace: Workspace, path: str | Path) -> None:
+    def __init__(self, workspace: Workspace, path: Path) -> None:
         try:
-            rel_path = os.path.relpath(path, workspace.path)
-            app_dir, design_dir, _remainder = rel_path.split(os.path.sep, maxsplit=2)
-            app_dir = os.path.join(workspace.path, app_dir)
-            self.app = PuakmaApplication.from_dir(app_dir)
-        except ValueError:
-            raise InvalidDesignPathError(f"Invalid path to a Design Object '{path}'")
+            rel_path = path.relative_to(workspace.path)
+            app_dir, design_dir, _rem = str(rel_path).split(os.path.sep, maxsplit=2)
+            app_path = workspace.path / app_dir
+            self.app = PuakmaApplication.from_dir(app_path)
+        except ValueError as e:
+            raise InvalidDesignPathError(f"Invalid path to Design Object '{path}': {e}")
 
         self.workspace = workspace
-        self.path = Path(path) if not isinstance(path, Path) else path
-        self.rel_path = rel_path
-        self.app_dir = app_dir
+        self.path = path
+        self.app_dir_path = app_path
         self.design_dir = design_dir
-        self.file_name = os.path.basename(path)
-        self.design_name, self.file_ext = os.path.splitext(self.file_name)
+        self.fname = path.name
+        self.design_name, self.ext = os.path.splitext(self.fname)
 
     def __str__(self) -> str:
         return str(self.path)

@@ -16,10 +16,12 @@ from vortex.util import VERSION
 
 if TYPE_CHECKING:
     from vortex.models import PuakmaServer
+    from vortex.models import DesignObject
 
 logger = logging.getLogger("vortex")
 
 _XSD_INTEGER: Literal["xsd:integer"] = "xsd:integer"
+_XSD_INT: Literal["xsd:int"] = "xsd:int"
 _XSD_STRING: Literal["xsd:string"] = "xsd:string"
 _XSD_BOOLEAN: Literal["xsd:boolean"] = "xsd:boolean"
 _XSD_BASE64_BINARY: Literal["xsd:base64Binary"] = "xsd:base64Binary"
@@ -27,13 +29,15 @@ _XSD_BASE64_BINARY: Literal["xsd:base64Binary"] = "xsd:base64Binary"
 
 class _SOAPParam(NamedTuple):
     name: str
-    xsi_type: Literal["xsd:integer", "xsd:string", "xsd:boolean", "xsd:base64Binary"]
+    xsi_type: Literal[
+        "xsd:integer", "xsd:string", "xsd:boolean", "xsd:base64Binary", "xsd:int"
+    ]
     value: Any
 
 
 class SOAPResponseParseError(Exception):
     def __init__(self, msg: str, response: ET.Element | None) -> None:
-        e = f"Error parsing SOAP response: {msg}"
+        e = f"Error parsing SOAP response [{response}]: {msg}"
         if response and "Fault" in response[0].tag:
             e += "\n".join(
                 [f"{ele.text.strip()}" for ele in response.findall(".//") if ele.text]
@@ -103,16 +107,20 @@ class _PuakmaSOAPService(ABC):
             raise SOAPResponseParseError(msg, response)
 
         resp = response_root.find(".//{urn:" + self.name + "}" + operation)
-        if not resp:
+        if resp is None:
             _error("No matching response element", resp)
-
-        return_node = resp[0]
-        expected_tag = operation + "Return"
-        if return_node.tag != expected_tag:
-            _error(
-                f"Expected Return Tag '{expected_tag}' got '{return_node.tag}'", resp
-            )
-        elif not return_node.text:
+        try:
+            return_node = resp[0]
+        except IndexError:
+            return_node = resp
+        else:
+            expected_tag = f"{operation}Return"
+            if return_node.tag != expected_tag:
+                _error(
+                    f"Expected Return Tag '{expected_tag}' got '{return_node.tag}'",
+                    resp,
+                )
+        if not return_node.text:
             _error(f"Response tag [{return_node.tag}] has no content", resp)
         try:
             # xml response - CDATA
@@ -172,6 +180,72 @@ class AppDesigner(_PuakmaSOAPService):
         params = [_SOAPParam("p1", _XSD_INTEGER, app_id)]
         resp = self.post(operation, params)
         return resp
+
+    async def aupdate_design_object(
+        self,
+        obj: DesignObject,
+    ) -> int:
+        """
+        Updates the design object with the given id with the values provided.
+        If design_object_id is None (the default), then a new design object is created.
+        Returns the ID of the design_object created or updated or -1 if unsuccessful
+        """
+        operation = "updateDesignObject"
+        params = [
+            _SOAPParam("p1", _XSD_INTEGER, obj.id),
+            _SOAPParam("p2", _XSD_INTEGER, obj.app.id),
+            _SOAPParam("p3", _XSD_STRING, obj.name),
+            _SOAPParam("p4", _XSD_INT, obj.design_type.value),
+            _SOAPParam("p5", _XSD_STRING, obj.content_type),
+            _SOAPParam("p6", _XSD_STRING, obj.comment),
+            _SOAPParam("p7", _XSD_STRING, ""),  # 'options' holds scheduling data
+            _SOAPParam("p8", _XSD_STRING, obj.inherit_from),
+        ]
+
+        resp = await self.apost(operation, params)
+        id_ = int(resp.text if resp.text else -1)
+        obj.id = id_
+        return id_
+
+    def update_design_object(
+        self,
+        obj: DesignObject,
+    ) -> int:
+        """
+        Updates the design object with the given id with the values provided.
+        If design_object_id is None (the default), then a new design object is created.
+        Returns the ID of the design_object created or updated or -1 if unsuccessful
+        """
+        operation = "updateDesignObject"
+        params = [
+            _SOAPParam("p1", _XSD_INTEGER, obj.id),
+            _SOAPParam("p2", _XSD_INTEGER, obj.app.id),
+            _SOAPParam("p3", _XSD_STRING, obj.name),
+            _SOAPParam("p4", _XSD_INT, obj.design_type.value),
+            _SOAPParam("p5", _XSD_STRING, obj.content_type),
+            _SOAPParam("p6", _XSD_STRING, obj.comment),
+            _SOAPParam("p7", _XSD_STRING, ""),  # 'options' holds scheduling data
+            _SOAPParam("p8", _XSD_STRING, obj.inherit_from),
+        ]
+
+        resp = self.post(operation, params)
+        id_ = int(resp.text if resp.text else -1)
+        obj.id = id_
+        return id_
+
+    async def aremove_design_object(self, design_object_id: int) -> None:
+        operation = "removeDesignObject"
+        params = [_SOAPParam("p1", _XSD_INTEGER, design_object_id)]
+        await self.apost(operation, params)
+
+    def remove_design_object(self, design_object_id: int) -> None:
+        """
+        Remove a Design Objects.
+        This Operation has a 'void' return type i.e. no way to know if successful (sad)
+        """
+        operation = "removeDesignObject"
+        params = [_SOAPParam("p1", _XSD_INTEGER, design_object_id)]
+        self.post(operation, params)
 
 
 class ServerDesigner(_PuakmaSOAPService):

@@ -30,11 +30,15 @@ password =
 """
 
 
-class ServerConfigError(Exception):
+class WorkspaceError(Exception):
     pass
 
 
-class WorkspaceInUseError(Exception):
+class WorkspaceInUseError(WorkspaceError):
+    pass
+
+
+class ServerConfigError(WorkspaceError):
     pass
 
 
@@ -47,8 +51,9 @@ class Workspace:
         if init:
             self.init()
         if not self._path.is_dir():
-            raise NotADirectoryError(
-                f"'{self._path}' is not a valid directory or it does not exist"
+            raise WorkspaceError(
+                f"Workspace does not exist: {path}\n"
+                "Hint: You can create it with 'vortex config --init'"
             )
 
     def __str__(self) -> str:

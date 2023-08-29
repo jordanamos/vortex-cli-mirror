@@ -12,14 +12,16 @@ import threading
 import time
 from collections.abc import Callable
 from collections.abc import Generator
+from enum import Enum
 from pathlib import Path
+from types import TracebackType
 from typing import Any
 from typing import IO
+from typing import Literal
 
 logger = logging.getLogger("vortex")
 
 VERSION = importlib.metadata.version("vortex_cli")
-
 
 if sys.platform == "win32":
     import msvcrt
@@ -85,6 +87,66 @@ else:
         return os.execvp(cmd, [cmd, *args])
 
 
+class Colour(Enum):
+    NORMAL = "\033[m"
+    RED = "\033[41m"
+    BOLD = "\033[1m"
+    GREEN = "\033[42m"
+    YELLOW = "\033[43;30m"
+
+    @staticmethod
+    def highlight(text: str, colour: Colour, replace_in: str | None = None) -> str:
+        highlighted_txt = f"{colour.value}{text}{Colour.NORMAL.value}"
+        if replace_in:
+            highlighted_txt = replace_in.replace(text, highlighted_txt)
+        return highlighted_txt
+
+
+class Spinner:
+    _spin_cycle = itertools.cycle(["-", "/", "|", "\\"])
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        self.clear = f"\r{' ' * (len(self.message) + 2)}\r"
+        self.delay = 0.1
+        self.running = False
+        self.thread: threading.Thread | None = None
+
+    def _spin(self) -> None:
+        while self.running:
+            sys.stdout.write(f"\033[?25l{next(self._spin_cycle)} {self.message}\r")
+            sys.stdout.flush()
+            time.sleep(0.1)
+
+    def start(self) -> None:
+        self.running = True
+        self.thread = threading.Thread(target=self._spin)
+        self.thread.start()
+
+    def _clear_msg(self) -> None:
+        sys.stdout.write(f"\033[?25h{self.clear}")
+        sys.stdout.flush()
+
+    def stop(self) -> None:
+        self.running = False
+        if self.thread:
+            self.thread.join()
+        self._clear_msg()
+
+    def __enter__(self) -> Spinner:
+        self.start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None = None,
+    ) -> Literal[False]:
+        self.stop()
+        return False
+
+
 @contextlib.contextmanager
 def file_lock(
     path: os.PathLike[str],
@@ -107,7 +169,7 @@ def clean_dir_on_failure(path: Path) -> Generator[None, None, None]:
     try:
         yield
     except BaseException:
-        if os.path.exists(path):
+        if path.exists():
             logger.info(f"Cleaning up {path}...")
             shutil.rmtree(path)
         raise
@@ -115,30 +177,6 @@ def clean_dir_on_failure(path: Path) -> Generator[None, None, None]:
 
 def print_row_break(center_str: str = "") -> None:
     print("\n", center_str.center(79, "="), "\n")
-
-
-@contextlib.contextmanager
-def spinner(message: str) -> Generator[None, None, None]:
-    def spin() -> None:
-        while running:
-            sys.stdout.write(f"\033[?25l {next(spin_cycle)} {message}\r")
-            sys.stdout.flush()
-            time.sleep(0.1)
-            sys.stdout.write(clear)
-            sys.stdout.flush()
-
-    spin_cycle = itertools.cycle(["-", "/", "|", "\\"])
-    clear = f"\r{' ' * (len(message) + 2)}\r"
-    running = True
-    thread = threading.Thread(target=spin)
-    try:
-        thread.start()
-        yield
-    finally:
-        running = False
-        thread.join()
-        sys.stdout.write(f"'\033[?25h'{clear}")
-        sys.stdout.flush()
 
 
 def shorten_text(text: str, max_len: int = 30) -> str:
