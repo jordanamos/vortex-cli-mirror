@@ -2,26 +2,28 @@ from __future__ import annotations
 
 import contextlib
 import errno
-import importlib.metadata
-import itertools
 import logging
 import os
 import shutil
 import sys
-import threading
-import time
+import webbrowser
 from collections.abc import Callable
 from collections.abc import Generator
-from enum import Enum
+from collections.abc import Iterable
 from pathlib import Path
 from types import TracebackType
 from typing import Any
 from typing import IO
-from typing import Literal
+from typing import TYPE_CHECKING
+
+import tabulate
+
+if TYPE_CHECKING:
+    from vortex.models import DesignObject
+    from vortex.models import PuakmaApplication
 
 logger = logging.getLogger("vortex")
 
-VERSION = importlib.metadata.version("vortex_cli")
 
 if sys.platform == "win32":
     import msvcrt
@@ -87,66 +89,6 @@ else:
         return os.execvp(cmd, [cmd, *args])
 
 
-class Colour(Enum):
-    NORMAL = "\033[m"
-    RED = "\033[41m"
-    BOLD = "\033[1m"
-    GREEN = "\033[42m"
-    YELLOW = "\033[43;30m"
-
-    @staticmethod
-    def highlight(text: str, colour: Colour, replace_in: str | None = None) -> str:
-        highlighted_txt = f"{colour.value}{text}{Colour.NORMAL.value}"
-        if replace_in:
-            highlighted_txt = replace_in.replace(text, highlighted_txt)
-        return highlighted_txt
-
-
-class Spinner:
-    _spin_cycle = itertools.cycle(["-", "/", "|", "\\"])
-
-    def __init__(self, message: str) -> None:
-        self.message = message
-        self.clear = f"\r{' ' * (len(self.message) + 2)}\r"
-        self.delay = 0.1
-        self.running = False
-        self.thread: threading.Thread | None = None
-
-    def _spin(self) -> None:
-        while self.running:
-            sys.stdout.write(f"\033[?25l{next(self._spin_cycle)} {self.message}\r")
-            sys.stdout.flush()
-            time.sleep(0.1)
-
-    def start(self) -> None:
-        self.running = True
-        self.thread = threading.Thread(target=self._spin)
-        self.thread.start()
-
-    def _clear_msg(self) -> None:
-        sys.stdout.write(f"\033[?25h{self.clear}")
-        sys.stdout.flush()
-
-    def stop(self) -> None:
-        self.running = False
-        if self.thread:
-            self.thread.join()
-        self._clear_msg()
-
-    def __enter__(self) -> Spinner:
-        self.start()
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None = None,
-    ) -> Literal[False]:
-        self.stop()
-        return False
-
-
 @contextlib.contextmanager
 def file_lock(
     path: os.PathLike[str],
@@ -179,10 +121,102 @@ def print_row_break(center_str: str = "") -> None:
     print("\n", center_str.center(79, "="), "\n")
 
 
-def shorten_text(text: str, max_len: int = 30) -> str:
+def shorten_or_pad_text(
+    text: str, max_len: int = 30, *, min_len: int = 0, sep: str = "..."
+) -> str:
     if len(text) <= max_len:
+        if len(text) < min_len:
+            text = text.ljust(min_len, ".")
         return text
-    max_len -= len("...")
+    max_len -= len(sep)
     start_len = max_len // 2
     end_len = max_len - start_len
-    return f"{text[:start_len]}...{text[-end_len:]}"
+    return f"{text[:start_len]}{sep}{text[-end_len:]}"
+
+
+def render_objects(
+    objs: Iterable[DesignObject],
+    *,
+    show_params: bool = False,
+) -> None:
+    row_headers = ["ID", "Name", "Type", "Application"]
+    row_data = []
+    if show_params:
+        row_headers.append("Parent Page")
+        row_headers.append("Open Action")
+        row_headers.append("Save Action")
+
+    for obj in sorted(objs, key=lambda obj: obj.name):
+        row = [obj.id, obj.name, obj.design_type.name, str(obj.app)]
+        if show_params:
+            row.append(obj.parent_page or "")
+            row.append(obj.open_action or "")
+            row.append(obj.save_action or "")
+        row_data.append(row)
+
+    print(tabulate.tabulate(row_data, headers=row_headers))
+
+
+def render_apps(
+    apps: list[PuakmaApplication],
+    *,
+    show_inherited: bool,
+) -> None:
+    row_headers = [
+        "ID",
+        "Name",
+        "Group",
+        "Template Name",
+    ]
+    row_data = []
+
+    if show_inherited:
+        row_headers.append("Inherits From")
+
+    for app in sorted(apps, key=lambda x: (x.group.casefold(), x.name.casefold())):
+        row = [app.id, app.name, app.group, app.template_name]
+        if show_inherited:
+            row.append(app.inherit_from)
+        row_data.append(row)
+    print(tabulate.tabulate(row_data, headers=row_headers))
+
+
+def open_app_urls(
+    *apps: PuakmaApplication,
+    open_dev_url: bool = True,
+) -> None:
+    # If we're going to open 10+ urls, lets confirm with the user
+    len_apps = len(apps) * (2 if open_dev_url else 1)
+    if len_apps > 9 and input(
+        f"Open {len_apps} application URLs? Enter '[y]es' to continue: "
+    ).strip().lower() not in ["y", "yes"]:
+        return
+    for app in apps:
+        webbrowser.open(app.url)
+        if open_dev_url:
+            webbrowser.open(app.web_design_url)
+
+
+def rmtree(path: Path) -> None:
+    def _handle_race(
+        func: Callable[..., Any],
+        path: str,
+        exc: tuple[type[OSError], OSError, TracebackType],
+    ) -> None:
+        # Avoid some race conditions
+        excvalue = exc[1]
+        if isinstance(excvalue, FileNotFoundError):
+            logger.debug(excvalue.strerror)
+        elif (
+            excvalue.errno == errno.ENOTEMPTY
+            and os.path.exists(path)
+            and os.path.isdir(path)
+        ):
+            logger.debug(f"Failed to remove {path}: {excvalue.strerror}. Retrying...")
+            shutil.rmtree(path)
+            logger.debug(f"Managed to remove {path}.")
+        else:
+            raise excvalue
+
+    logger.info(f"Cleaning up {path}...")
+    shutil.rmtree(path, ignore_errors=False, onerror=_handle_race)

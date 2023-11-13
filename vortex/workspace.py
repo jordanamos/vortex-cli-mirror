@@ -24,6 +24,7 @@ SAMPLE_CONFIG = """\
 host =
 port = 80
 soap_path = system/SOAPDesigner.pma
+web_design_path = system/webdesign.pma
 puakma_db_conn_id =
 username =
 password =
@@ -42,9 +43,12 @@ class ServerConfigError(WorkspaceError):
     pass
 
 
+class PuakmaApplicationNotFound(WorkspaceError):
+    pass
+
+
 class Workspace:
-    WORKSPACE_ENV_VAR = "VORTEX_WORKSPACE"
-    CONFIG_FILE_NAME = "vortex-server-config.ini"
+    ENV_VAR = "VORTEX_HOME"
 
     def __init__(self, path: str | None = None, init: bool = False) -> None:
         self._path = Path(path or Workspace.get_default_workspace())
@@ -52,9 +56,11 @@ class Workspace:
             self.init()
         if not self._path.is_dir():
             raise WorkspaceError(
-                f"Workspace does not exist: {path}\n"
-                "Hint: You can create it with 'vortex config --init'"
+                f"Workspace path '{self._path}' does not exist."
+                " You can create it with '--init'."
             )
+        if not os.access(self._path, os.W_OK):
+            raise WorkspaceError(f"Workspace '{self._path}' is not writeable.")
 
     def __str__(self) -> str:
         return str(self._path)
@@ -64,29 +70,38 @@ class Workspace:
         return self._path
 
     @property
-    def config_file(self) -> Path:
-        return self.path / self.CONFIG_FILE_NAME
+    def config_dir(self) -> Path:
+        return self.path / "config"
 
     @property
-    def vscode_directory(self) -> Path:
+    def server_config_file(self) -> Path:
+        return self.config_dir / "servers.ini"
+
+    @property
+    def vscode_dir(self) -> Path:
         return self.path / ".vscode"
 
     @property
-    def code_workspace_file(self) -> Path:
-        return self.vscode_directory / "vortex.code-workspace"
+    def exports_dir(self) -> Path:
+        return self.path / "exports"
 
-    def print_info(self) -> None:
-        print(f"Workspace: {self.path}")
-        print(f"Config File: {self.config_file}")
-        print(f"Code-Workspace File: {self.code_workspace_file}")
-        print(
-            f"{Workspace.WORKSPACE_ENV_VAR} Environment Variable: "
-            f"{os.getenv(Workspace.WORKSPACE_ENV_VAR, '<not set>')}"
-        )
+    @property
+    def logs_dir(self) -> Path:
+        return self.path / "logs"
+
+    @property
+    def code_workspace_file(self) -> Path:
+        return self.vscode_dir / "vortex.code-workspace"
+
+    def lookup_app(self, server: PuakmaServer, app_id: int) -> PuakmaApplication:
+        for app in self.listapps(server):
+            if app.id == app_id:
+                return app
+        raise PuakmaApplicationNotFound(f"No local application found with ID {app_id}")
 
     def print_server_config_info(self, server_section: str | None) -> None:
         config = configparser.ConfigParser()
-        config.read(self.config_file)
+        config.read(self.server_config_file)
         section = server_section or config.sections()[0] if config.sections() else ""
         try:
             items = config.items(section)
@@ -96,28 +111,30 @@ class Workspace:
                     v = "<set>"
                 print(f"{k}: {v}")
         except configparser.NoSectionError:
-            pass
+            logger.error(f"No server definition found for '{server_section}'")
 
     @classmethod
     def get_default_workspace(cls) -> str:
-        ret = os.getenv(
-            cls.WORKSPACE_ENV_VAR,
-            os.path.join(os.path.expanduser("~"), "vortex-cli-workspace"),
-        )
-        return os.path.realpath(ret)
+        path = os.getenv(cls.ENV_VAR)
+        if not path:
+            path = os.path.join(os.path.expanduser("~"), "vortex-cli-workspace")
+            logger.debug(f"'{Workspace.ENV_VAR}' not set. Using default {path}")
+        return os.path.realpath(path)
 
     def init(self) -> None:
-        if not self.path.is_dir():
-            self.path.mkdir()
-            logger.info(f"Directory created: {self.path}")
+        dirs = [self.path, self.config_dir]
+        for dir in dirs:
+            if not dir.is_dir():
+                dir.mkdir()
 
-        if not self.config_file.exists():
-            with open(self.config_file, "w") as f:
+        if not self.server_config_file.exists():
+            with open(self.server_config_file, "w") as f:
                 f.write(SAMPLE_CONFIG)
-            logger.info(f"Config file created: {self.config_file}")
 
         if not self.code_workspace_file.exists():
             self.update_vscode_settings(reset=True)
+
+        logger.info(f"Initialised workspace {self.path}")
 
     @contextlib.contextmanager
     def exclusive_lock(self) -> Generator[None, None, None]:
@@ -141,7 +158,9 @@ class Workspace:
             pickle.dump(app, f)
         return app_path
 
-    def listdir(self, strict: bool = True) -> list[Path]:
+    def listdir(
+        self, server: PuakmaServer | None = None, *, strict: bool = True
+    ) -> list[Path]:
         """
         Returns a list of directories that contain a parseable
         .PuakmaApplication.pickle file.
@@ -154,7 +173,9 @@ class Workspace:
             if sub_dir.is_dir():
                 if strict:
                     try:
-                        PuakmaApplication.from_dir(sub_dir)
+                        app = PuakmaApplication.from_dir(sub_dir)
+                        if server and app.host != server.host:
+                            continue
                     except ValueError:
                         continue
                 else:
@@ -164,17 +185,19 @@ class Workspace:
                 ret.append(sub_dir)
         return ret
 
-    def listapps(self) -> list[PuakmaApplication]:
-        return [PuakmaApplication.from_dir(dir) for dir in self.listdir()]
+    def listapps(self, server: PuakmaServer | None = None) -> list[PuakmaApplication]:
+        return [PuakmaApplication.from_dir(dir) for dir in self.listdir(server)]
 
     def read_server_from_config(self, server_name: str | None = None) -> PuakmaServer:
         def _error(msg: str) -> NoReturn:
-            raise ServerConfigError(f"{msg}. Check config in '{self.config_file}'.")
+            raise ServerConfigError(
+                f"{msg}. Check config in '{self.server_config_file}'."
+            )
 
         config = configparser.ConfigParser()
 
         try:
-            config.read(self.config_file)
+            config.read(self.server_config_file)
             if not config.sections():
                 _error("No server definition defined")
 
@@ -186,6 +209,7 @@ class Workspace:
             host = config.get(server_name, "host")
             port = config.getint(server_name, "port")
             soap_path = config.get(server_name, "soap_path")
+            webdesign_path = config.get(server_name, "webdesign_path")
             puakma_db_conn_id = config.getint(server_name, "puakma_db_conn_id")
             username = config.get(server_name, "username", fallback=None)
             password = config.get(server_name, "password", fallback=None)
@@ -194,21 +218,31 @@ class Workspace:
                 raise ValueError(f"Empty 'host' value for server '{server_name}'")
             if not soap_path:
                 raise ValueError(f"Empty 'soap_path' value for server '{server_name}'")
+            if not webdesign_path:
+                raise ValueError(
+                    f"Empty 'webdesign_path' value for server '{server_name}'"
+                )
 
             return PuakmaServer(
-                host, port, soap_path, puakma_db_conn_id, username, password
+                host,
+                port,
+                soap_path,
+                webdesign_path,
+                puakma_db_conn_id,
+                username,
+                password,
             )
         except (configparser.Error, ValueError) as e:
             _error(f"Error reading server from config: {str(e)}")
 
-    def update_vscode_settings(self: Workspace, reset: bool = False) -> int:
+    def update_vscode_settings(self: Workspace, reset: bool = False) -> None:
         """
         Updates or creates the vortex.code-workspace file inside the .vscode directory
         """
 
         def _reset() -> dict[Any, Any]:
-            if not self.vscode_directory.exists():
-                self.vscode_directory.mkdir()
+            if not self.vscode_dir.exists():
+                self.vscode_dir.mkdir()
             return {}
 
         if reset:
@@ -221,11 +255,14 @@ class Workspace:
                 workspace_settings = _reset()
             except json.JSONDecodeError as e:
                 logger.error(f"Error parsing {self.code_workspace_file}: {e}")
-                return 1
+                return
 
         # Folder settings
+        vortex_dirs = [self.vscode_dir, self.config_dir]
+        if self.logs_dir.is_dir():
+            vortex_dirs.append(self.logs_dir)
         workspace_folders = [
-            os.path.join("..", dir.name) for dir in (Path(".vscode"), *self.listdir())
+            os.path.join("..", dir.name) for dir in (*vortex_dirs, *self.listdir())
         ]
         folder_settings = {
             "folders": [{"path": folder} for folder in workspace_folders]
@@ -260,5 +297,4 @@ class Workspace:
         with open(self.code_workspace_file, "w") as f:
             json.dump(workspace_settings, f, indent=2)
         status = "Reset" if reset else "Updated"
-        logger.info(f"{status} settings in '{self.code_workspace_file}'")
-        return 0
+        logger.debug(f"{status} settings in '{self.code_workspace_file}'")
