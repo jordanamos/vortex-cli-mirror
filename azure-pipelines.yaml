@@ -2,6 +2,7 @@ trigger:
   branches:
     include:
       - main
+  batch: true
 
 pool:
   vmImage: "ubuntu-latest"
@@ -29,7 +30,7 @@ stages:
     dependsOn: pre_commit
     jobs:
       - job: upload
-        displayName: Upload
+        displayName: Upload to PyPI
         steps:
           - task: UsePythonVersion@0
             displayName: Use Python 3.10

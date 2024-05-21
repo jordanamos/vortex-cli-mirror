@@ -1,15 +1,35 @@
 from __future__ import annotations
 
 import functools
+from argparse import _ArgumentGroup
 from argparse import _MutuallyExclusiveGroup
 from argparse import _SubParsersAction
 from argparse import ArgumentParser
 from argparse import ArgumentTypeError
+from argparse import Namespace
+from argparse import RawDescriptionHelpFormatter
 from pathlib import Path
 
 from vortex.models import DesignType
 
-NON_SERVER_COMMANDS = ("code", "clean", "config", "docs")
+_EXECUTE_PARSER_DESCRIPTION = """\
+    status                | Display the server status
+    sessions              | Display the user sessions
+    session [username]    | Display the session details
+    quit [save]           | Shut down the server, opt. save sessions
+    gc                    | Ask the JVM to collect garbage
+    restart server [save] | Restart the server, reloading puakma.jar, opt. save sessions
+    load [class]          | Load the named class ie: 'puakma.addin.http.HTTP'
+    unload [task]         | Unload the named task ie: HTTP
+    reload [task]         | Unload then load the named task ie: HTTP
+    drop [who]            | Drop user session. Use 'all' for all sessions
+    tell TASK ...         | Tells a task to perform some action
+    clear ITEM            | eg: log, errors
+    config WHAT           | Use RELOAD to refresh the server settings
+    show VARNAME          | Shows a puakma.config variable, or java for System props
+    stats                 | Display statistics from each server addin
+    store WHAT            | Access the global cache; flush, status
+"""
 
 
 def _check_int_in_range(val: str, min: int = 0, max: int | None = 50) -> int:
@@ -29,7 +49,7 @@ def _add_server_option(parser: ArgumentParser) -> None:
 
 
 def _add_design_type_option(
-    parser: ArgumentParser | _MutuallyExclusiveGroup,
+    parser: ArgumentParser | _MutuallyExclusiveGroup | _ArgumentGroup,
     nargs: str | None = "*",
     required: bool = False,
 ) -> None:
@@ -45,6 +65,51 @@ def _add_design_type_option(
             f"Choices: {[t.name.lower() for t in DesignType if t != DesignType.ERROR]}"
         ),
     )
+
+
+def validate_args(
+    args: Namespace,
+    new_parser: ArgumentParser,
+    clone_parser: ArgumentParser,
+) -> None:
+    if args.command == "new" and args.subcommand == "object":
+        missing_required_fields = not args.update_id and not (
+            args.name and args.app_id and args.design_type
+        )
+        missing_content_type = (
+            args.design_type in (DesignType.RESOURCE, DesignType.DOCUMENTATION)
+            and not args.content_type
+        )
+        update_arg_contains_app_id = args.update_id and args.app_id
+        update_is_missing_args = args.update_id and not (
+            args.name
+            or args.app_id
+            or args.design_type
+            or args.comment
+            or args.inherit_from
+            or args.open_action
+            or args.save_action
+            or args.parent_page
+            or args.content_type
+        )
+        msg = None
+        if missing_required_fields:
+            msg = "--name, --app-id, and --type are required unless using --update"
+        elif missing_content_type:
+            msg = (
+                f"--type argument value '{args.design_type.name}' "
+                "requires --content-type"
+            )
+        elif update_arg_contains_app_id:
+            msg = "Can't use --app-id with --update"
+        elif update_is_missing_args:
+            msg = "Please spectify an option to update"
+
+        if msg:
+            new_parser.error(msg)
+
+    elif args.command == "clone" and not (args.app_ids or args.reclone):
+        clone_parser.error("Please specifiy the APP_ID[s] to clone or use --reclone")
 
 
 def add_code_parser(
@@ -174,7 +239,7 @@ def add_clone_parser(
     clone_parser.add_argument(
         "--export",
         nargs="?",
-        metavar="PMX_PATH",
+        metavar="DIR",
         dest="export_path",
         const="",
         help=(
@@ -182,6 +247,16 @@ def add_clone_parser(
             "folder. Default is 'exports' in the workspace."
         ),
         type=Path,
+    )
+    clone_parser.add_argument(
+        "--timeout",
+        "-t",
+        type=int,
+        default=100,
+        help=(
+            "Set the timeout duration in seconds when using --export. "
+            "Default is %(default)s."
+        ),
     )
     _add_server_option(clone_parser)
     return clone_parser
@@ -236,6 +311,18 @@ def add_config_parser(command_parser: _SubParsersAction[ArgumentParser]) -> None
         "--output-server-config",
         action="store_true",
         help="Output the current server definition in the config file.",
+    )
+    config_mutex.add_argument(
+        "--list-servers",
+        "-l",
+        action="store_true",
+        help="List the server definitions in the config file",
+    )
+    config_mutex.add_argument(
+        "--set",
+        help="Set an option value in a section. --set <section> <option> <value>",
+        nargs=3,
+        metavar=("SECTION", "OPTION", "VALUE"),
     )
     _add_server_option(config_parser)
 
@@ -340,14 +427,27 @@ def add_new_parser(
         "new",
         help="Create new Design Objects, Applications or Keywords",
     )
+    new_parser.add_argument(
+        "--update",
+        "-u",
+        type=int,
+        metavar="ID",
+        dest="update_id",
+        help="Update a Design Object with the given ID instead",
+    )
     _add_server_option(new_parser)
 
     sub_parser = new_parser.add_subparsers(dest="subcommand")
 
+    # Object parser
     object_parser = sub_parser.add_parser("object", help="Create a new Design Object")
-    object_parser.add_argument("--app-id", type=int, required=True)
-    object_parser.add_argument("--name", "-n", required=True)
-    _add_design_type_option(object_parser, nargs=None, required=True)
+    obj_required_no_update_group = object_parser.add_argument_group(
+        "Required When Creating (no --update)"
+    )
+
+    obj_required_no_update_group.add_argument("--app-id", type=int)
+    obj_required_no_update_group.add_argument("--name", "-n")
+    _add_design_type_option(obj_required_no_update_group, nargs=None)
 
     obj_optional_group = object_parser.add_argument_group("Optional Arguments")
     obj_optional_group.add_argument("--comment")
@@ -363,6 +463,7 @@ def add_new_parser(
         ),
     )
 
+    # App Parser
     app_parser = sub_parser.add_parser("app", help="Create a new Puakama Application")
     app_parser.add_argument("--name", "-n", help="The application name", required=True)
     app_parser.add_argument(
@@ -380,6 +481,7 @@ def add_new_parser(
         help="Create the application from the given .pmx path",
     )
 
+    # Keyword Parser
     keyword_parser = sub_parser.add_parser("keyword", help="Create a new Keyword")
     keyword_parser.add_argument("--app-id", type=int, required=True)
     keyword_parser.add_argument("--name", "-n", help="The keyword name", required=True)
@@ -435,21 +537,29 @@ def add_db_parser(command_parser: _SubParsersAction[ArgumentParser]) -> None:
         action="store_true",
         help="List the tables in the Database",
     )
-    db_parser.add_argument(
+    sql_group = db_parser.add_argument_group("SQL Options")
+    sql_group.add_argument(
         "--update",
         "-u",
         action="store_true",
         help="Set this flag when running querys for altering/updating the database",
     )
-    db_parser.add_argument(
+    sql_group.add_argument(
+        "--all-cols",
+        action="store_false",
+        help="Show all columns in the output. Default is max 8 columns",
+        dest="truncate_cols",
+    )
+    sql_group.add_argument(
         "--limit",
         "-n",
-        metavar="N",
+        metavar="INT",
         type=_check_int_in_range,
         help=(
-            "The number of results to be returned when using --sql between 1 and 50. "
-            "This flag adds the 'LIMIT' clause of the given SQL query. "
-            "Default is %(default)s."
+            "Default is %(default)s. "
+            "The number of results to be returned between 1 and 50. "
+            "This flag adds the 'LIMIT' clause of the given SQL query "
+            "and so that clause should never be used when executing a query."
         ),
         default=5,
     )
@@ -462,12 +572,19 @@ def add_docs_parser(command_parser: _SubParsersAction[ArgumentParser]) -> None:
 def add_execute_parser(command_parser: _SubParsersAction[ArgumentParser]) -> None:
     execute_parser = command_parser.add_parser(
         "execute",
-        aliases=("exec",),
+        aliases=("ex",),
         help="Execute a command on the server. Execute '?' for more info.",
+        description=_EXECUTE_PARSER_DESCRIPTION,
+        formatter_class=RawDescriptionHelpFormatter,
     )
     execute_parser_mutex = execute_parser.add_mutually_exclusive_group(required=True)
+    # 'cmd' here because 'command' conflicts with the command parser
     execute_parser_mutex.add_argument(
-        "cmd", help="The command to execute", metavar="CMD", nargs="?", default=""
+        "cmd",
+        help="The command to execute",
+        metavar="CMD",
+        nargs="?",
+        default="",
     )
     execute_parser_mutex.add_argument(
         "--refresh-design",
@@ -475,5 +592,20 @@ def add_execute_parser(command_parser: _SubParsersAction[ArgumentParser]) -> Non
         help="Refresh an application's design",
         dest="refresh_app_id",
         metavar="APP_ID",
+    )
+    execute_parser_mutex.add_argument(
+        "--run",
+        type=Path,
+        help=(
+            "Run the action at the given local file path. "
+            "Alias for 'tell agenda run /group/app.pma/action'"
+        ),
+        dest="run_action_path",
+        metavar="DESIGN_PATH",
+    )
+    execute_parser_mutex.add_argument(
+        "--schedule",
+        action="store_true",
+        help="View the agenda schedule. Alias for 'tell agenda schedule'",
     )
     _add_server_option(execute_parser)

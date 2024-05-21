@@ -17,6 +17,7 @@ class Spinner:
         self.delay = 0.1
         self.running = False
         self.thread: threading.Thread | None = None
+        self.disabled = not sys.stdout.isatty()
 
     def _spin(self) -> None:
         while self.running:
@@ -25,6 +26,8 @@ class Spinner:
             time.sleep(0.1)
 
     def start(self) -> None:
+        if self.disabled:
+            return
         self.running = True
         self.thread = threading.Thread(target=self._spin)
         self.thread.start()
@@ -34,6 +37,8 @@ class Spinner:
         sys.stdout.flush()
 
     def stop(self) -> None:
+        if self.disabled:
+            return
         self.running = False
         if self.thread:
             self.thread.join()

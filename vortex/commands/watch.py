@@ -40,7 +40,7 @@ def _error(change: Change, name: str, msg: str) -> Literal[False]:
 class _WorkspaceFilter(BaseFilter):
     ignore_files: tuple[str, ...] = (
         ".DS_Store",
-        PuakmaApplication.PICKLE_FILE,
+        PuakmaApplication.MANIFEST_FILE,
     )
 
     def __init__(self, workspace: Workspace, server: PuakmaServer) -> None:
@@ -250,7 +250,7 @@ class WorkspaceWatcher:
         if not self._confirm_change(change, obj):
             return _err_result("Operation Cancelled")
 
-        create_ok = await obj.acreate(self.server.app_designer)
+        create_ok = await obj.acreate_or_update(self.server.app_designer)
         if create_ok:
             app.design_objects.append(obj)
 
@@ -319,11 +319,11 @@ def _validate_java_class_file(
     major_version = int.from_bytes(bytes_header[6:8], byteorder="big")
     minor_version = int.from_bytes(bytes_header[4:6], byteorder="big")
     compiled_version: JavaClassVersion = (major_version, minor_version)
-    if expected_version and compiled_version != expected_version:
+    if expected_version and compiled_version[0] > expected_version[0]:
         return (
             False,
             f"File has been compiled with Java Class Version"
-            f"{compiled_version} but expected {expected_version}",
+            f"{compiled_version} which is greater than {expected_version}",
         )
     return True, ""
 
@@ -336,5 +336,6 @@ def watch(workspace: Workspace, server: PuakmaServer) -> int:
         workspace.exclusive_lock(),
         Spinner("Watching workspace, ^C to stop") as spinner,
     ):
+        workspace.update_vscode_settings(server=server)
         watcher = WorkspaceWatcher(workspace, server, spinner)
         return asyncio.run(watcher.watch())

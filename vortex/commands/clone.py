@@ -10,6 +10,7 @@ from typing import Any
 from vortex import util
 from vortex.models import DatabaseConnection
 from vortex.models import DesignObject
+from vortex.models import DesignObjectParam
 from vortex.models import DesignType
 from vortex.models import JavaClassVersion
 from vortex.models import PuakmaApplication
@@ -20,51 +21,20 @@ from vortex.workspace import Workspace
 logger = logging.getLogger("vortex")
 
 
-def clone(
-    workspace: Workspace,
-    server: PuakmaServer,
-    app_ids: list[int],
-    *,
-    get_resources: bool = False,
-    open_urls: bool = False,
-    reclone: bool = False,
-    export_path: Path | None = None,
-) -> int:
-    if reclone:
-        app_ids.extend(app.id for app in workspace.listapps(server))
-
-    action = "Cloning" if export_path is None else "Exporting"
-
-    with (
-        workspace.exclusive_lock(),
-        Spinner(f"{action} {len(app_ids)} application(s)..."),
-    ):
-        if export_path is not None:
-            if export_path == Path():
-                export_path = workspace.exports_dir
-                export_path.mkdir(exist_ok=True)
-            elif not export_path.is_dir():
-                logger.error(f"'{export_path}' is not a directory.")
-                return 1
-            ret = asyncio.run(_aexport_pmx(server, app_ids, export_path))
-        else:
-            ret = asyncio.run(
-                _aclone_apps(workspace, server, app_ids, get_resources, open_urls)
-            )
-        return ret
-
-
 async def _aexport_pmx(
     server: PuakmaServer,
     app_ids: list[int],
     output_dir: Path,
+    timeout: int,  # noqa: ASYNC109
 ) -> int:
     tasks = []
 
     async with server as s:
         await s.server_designer.ainitiate_connection()
         for app_id in app_ids:
-            task = asyncio.create_task(_aexport_app_pmx(server, app_id, output_dir))
+            task = asyncio.create_task(
+                _aexport_app_pmx(server, app_id, output_dir, timeout)
+            )
             tasks.append(task)
 
         ret = 0
@@ -88,92 +58,14 @@ async def _aexport_app_pmx(
     server: PuakmaServer,
     app_id: int,
     output_dir: Path,
+    timeout: int,  # noqa: ASYNC109
 ) -> int:
-    ret_bytes = await server.download_designer.adownload_pmx(app_id, True)
+    ret_bytes = await server.download_designer.adownload_pmx(app_id, True, timeout)
     now = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     output_path = output_dir / f"{now}_{server.host}_{app_id}.pmx"
-
     await asyncio.to_thread(_save_bytes, ret_bytes, output_path)
     logger.info(f"Successfully exported {app_id} to {output_dir}")
     return 0
-
-
-def _save_bytes(data: bytes, output_path: Path) -> None:
-    with open(output_path, "wb") as f:
-        f.write(data)
-
-
-async def _aclone_apps(
-    workspace: Workspace,
-    server: PuakmaServer,
-    app_ids: list[int],
-    get_resources: bool,
-    open_urls: bool,
-) -> int:
-    tasks = []
-    async with server as s:
-        await s.server_designer.ainitiate_connection()
-        for app_id in app_ids:
-            task = asyncio.create_task(_aclone_app(workspace, s, app_id, get_resources))
-            tasks.append(task)
-
-        ret = 0
-        for done in asyncio.as_completed(tasks):
-            try:
-                app, _ret = await done
-                if open_urls and app:
-                    util.open_app_urls(app)
-                ret |= _ret
-            except (KeyboardInterrupt, Exception):
-                for task in tasks:
-                    task.cancel()
-                raise
-            except asyncio.CancelledError:
-                logger.error("Operation Cancelled")
-                for task in tasks:
-                    task.cancel()
-                ret = 1
-                break
-        else:
-            workspace.update_vscode_settings()
-    return ret
-
-
-async def _aclone_app(
-    workspace: Workspace,
-    server: PuakmaServer,
-    app_id: int,
-    get_resources: bool,
-) -> tuple[PuakmaApplication | None, int]:
-    """Clone a Puakma Application into a newly created directory"""
-
-    app_xml, _obj_rows = await asyncio.gather(
-        server.app_designer.aget_application_xml(app_id),
-        PuakmaApplication.afetch_design_objects(server, app_id, get_resources),
-    )
-
-    try:
-        app, app_ele = _parse_app_xml(server, app_xml, app_id)
-    except (ValueError, KeyError) as e:
-        logger.error(e)
-        return None, 1
-
-    eles = app_ele.findall("designElement", namespaces=None)
-    objs = _aparse_design_objs(_obj_rows, app)
-    app.design_objects = _match_and_validate_design_objs(app, objs, eles)
-    app_dir = workspace.mkdir(app, True)
-    try:
-        logger.debug(f"Saving {len(objs)} Design Objects for [{app}]...")
-        await asyncio.to_thread(
-            _save_objs, workspace, app.design_objects, get_resources
-        )
-    except asyncio.CancelledError:
-        util.rmtree(app_dir)
-        return None, 1
-
-    logger.info(f"Successfully cloned {app}")
-
-    return app, 0
 
 
 def _save_objs(
@@ -182,7 +74,11 @@ def _save_objs(
     for obj in objs:
         if not obj.is_valid:
             logger.warning(f"Unable to save invalid design object {obj}")
-        elif not save_resources and obj.design_type == DesignType.RESOURCE:
+        elif (
+            not save_resources
+            and obj.design_type == DesignType.RESOURCE
+            and not obj.is_jar_library
+        ):
             continue
         else:
             obj.save(workspace)
@@ -256,21 +152,18 @@ def _match_and_validate_design_objs(
         package = ele.attrib.get("package", None)
         package_dir = Path(*package.split(".")) if package else None
 
-        open_action_ele = ele.find('.//designParam[@name="OpenAction"]')
-        open_action = open_action_ele.attrib["value"] if open_action_ele else None
-
-        save_action_ele = ele.find('.//designParam[@name="SaveAction"]')
-        save_action = save_action_ele.attrib["value"] if save_action_ele else None
-
-        parent_page_ele = ele.find('.//designParam[@name="ParentPage"]')
-        parent_page = parent_page_ele.attrib["value"] if parent_page_ele else None
+        param_eles = ele.findall(".//designParam")
+        params = []
+        for param_ele in param_eles:
+            param = DesignObjectParam(
+                param_ele.attrib["name"], param_ele.attrib["value"]
+            )
+            params.append(param)
         try:
             obj = objs.pop()
-            obj.is_jar_library = is_jar_library
+            obj.is_jar_library = is_jar_library or obj.file_ext == ".jar"
             obj.package_dir = package_dir
-            obj.open_action = open_action
-            obj.save_action = save_action
-            obj.parent_page = parent_page
+            obj.params = params
         except IndexError:
             design_type = DesignType(int(ele.attrib["designType"]))
             obj = DesignObject(
@@ -285,9 +178,124 @@ def _match_and_validate_design_objs(
                 package_dir,
                 "",
                 ele.attrib["inherit"],
-                parent_page=parent_page,
-                open_action=open_action,
-                save_action=save_action,
+                params=params,
             )
         new_objects.append(obj)
     return new_objects
+
+
+def _save_bytes(data: bytes, output_path: Path) -> None:
+    with open(output_path, "wb") as f:
+        f.write(data)
+
+
+async def _aclone_app(
+    workspace: Workspace,
+    server: PuakmaServer,
+    app_id: int,
+    get_resources: bool,
+) -> tuple[PuakmaApplication | None, int]:
+    """Clone a Puakma Application into a newly created directory"""
+
+    app_xml, _obj_rows = await asyncio.gather(
+        server.app_designer.aget_application_xml(app_id),
+        PuakmaApplication.afetch_design_objects(server, app_id, get_resources),
+    )
+
+    try:
+        app, app_ele = _parse_app_xml(server, app_xml, app_id)
+    except (ValueError, KeyError) as e:
+        logger.error(e)
+        return None, 1
+
+    eles = app_ele.findall("designElement", namespaces=None)
+    objs = _aparse_design_objs(_obj_rows, app)
+    app.design_objects = _match_and_validate_design_objs(app, objs, eles)
+    app_dir = workspace.mkdir(app, True)
+
+    for dir in DesignType.dirs():
+        (app_dir / dir).mkdir()
+
+    try:
+        logger.debug(f"Saving {len(objs)} Design Objects for [{app}]...")
+        await asyncio.to_thread(
+            _save_objs, workspace, app.design_objects, get_resources
+        )
+    except asyncio.CancelledError:
+        util.rmtree(app_dir)
+        return None, 1
+
+    logger.info(f"Successfully cloned {app}")
+
+    return app, 0
+
+
+async def _aclone_apps(
+    workspace: Workspace,
+    server: PuakmaServer,
+    app_ids: list[int],
+    get_resources: bool,
+    open_urls: bool,
+) -> int:
+    tasks = []
+    async with server as s:
+        await s.server_designer.ainitiate_connection()
+        for app_id in app_ids:
+            task = asyncio.create_task(_aclone_app(workspace, s, app_id, get_resources))
+            tasks.append(task)
+
+        ret = 0
+        for done in asyncio.as_completed(tasks):
+            try:
+                app, _ret = await done
+                if open_urls and app:
+                    util.open_app_urls(app)
+                ret |= _ret
+            except (KeyboardInterrupt, Exception):
+                for task in tasks:
+                    task.cancel()
+                raise
+            except asyncio.CancelledError:
+                logger.error("Operation Cancelled")
+                for task in tasks:
+                    task.cancel()
+                ret = 1
+                break
+        else:
+            workspace.update_vscode_settings(server=server)
+    return ret
+
+
+def clone(
+    workspace: Workspace,
+    server: PuakmaServer,
+    app_ids: list[int],
+    *,
+    timeout: int,
+    get_resources: bool = False,
+    open_urls: bool = False,
+    reclone: bool = False,
+    export_path: Path | None = None,
+) -> int:
+    if reclone:
+        app_ids.extend(app.id for app in workspace.listapps(server))
+
+    action = "Cloning" if export_path is None else "Exporting"
+
+    with (
+        workspace.exclusive_lock(),
+        Spinner(f"{action} {len(app_ids)} application(s)..."),
+    ):
+        if export_path is not None:
+            if export_path == Path():
+                export_path = workspace.exports_dir
+                export_path.mkdir(exist_ok=True)
+            elif not export_path.is_dir():
+                logger.error(f"'{export_path}' is not a directory.")
+                return 1
+            ret = asyncio.run(_aexport_pmx(server, app_ids, export_path, timeout))
+        else:
+            ret = asyncio.run(
+                _aclone_apps(workspace, server, app_ids, get_resources, open_urls)
+            )
+        return ret

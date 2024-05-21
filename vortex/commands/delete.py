@@ -1,16 +1,37 @@
 from __future__ import annotations
 
 import asyncio
+import collections
+import itertools
 import logging
+from collections.abc import Iterable
 
 from vortex.colour import Colour
 from vortex.models import DesignObject
+from vortex.models import DesignObjectAmbiguousError
+from vortex.models import DesignObjectNotFound
+from vortex.models import PuakmaApplication
 from vortex.models import PuakmaServer
-from vortex.soap import AppDesigner
 from vortex.util import render_objects
 from vortex.workspace import Workspace
 
 logger = logging.getLogger("vortex")
+
+
+async def _adelete_objs(server: PuakmaServer, objs: Iterable[DesignObject]) -> None:
+    async with server as s:
+        await s.server_designer.ainitiate_connection()
+        tasks = []
+        for obj in objs:
+            task = asyncio.create_task(obj.adelete(s.app_designer))
+            tasks.append(task)
+        for done in asyncio.as_completed(tasks):
+            try:
+                await done
+            except (asyncio.CancelledError, Exception):
+                for task in tasks:
+                    task.cancel()
+                raise
 
 
 def delete(
@@ -18,67 +39,40 @@ def delete(
     server: PuakmaServer,
     obj_ids: list[int],
 ) -> int:
-    objs = []
-    apps = []
-    for app in workspace.listapps(server):
-        for obj in app.design_objects:
-            if obj.id in obj_ids:
-                objs.append(obj)
-                if app not in apps:
-                    apps.append(app)
+    app_objs: dict[PuakmaApplication, list[DesignObject]] = collections.defaultdict(
+        list
+    )
+    for obj_id in obj_ids:
+        try:
+            _, obj = workspace.lookup_design_obj(server, obj_id)
+            app_objs[obj.app].append(obj)
+        except (DesignObjectNotFound, DesignObjectAmbiguousError) as e:
+            logger.error(e)
+            return 1
 
-    if not objs:
-        logger.error(f"No cloned Design Object found with ID {obj_ids}")
-        return 1
-
-    _deleted = Colour.colour("deleted", Colour.RED)
+    all_objs = list(itertools.chain(*app_objs.values()))
+    _deleted = Colour.colour("DELETED", Colour.RED)
     print(f"The following Design Objects will be {_deleted}:\n")
-    render_objects(objs)
+    render_objects(all_objs)
     if input("\n[Y/y] to continue:") not in ["Y", "y"]:
+        logger.error("Operation Cancelled")
         return 1
 
     with workspace.exclusive_lock():
-        ret = asyncio.run(_adelete_objs(workspace, server, objs))
-        for app in apps:
+        asyncio.run(_adelete_objs(server, all_objs))
+        for app, objs in app_objs.items():
+            for obj in objs:
+                app.design_objects.remove(obj)
+                path = obj.design_path(workspace).path
+                try:
+                    path.unlink()
+                    logger.debug(f"Deleted Local File: {path}")
+                except FileNotFoundError:
+                    msg = (
+                        f"Unable to delete local file because it doesn't exist: {path}"
+                        "\nIt may have already been deleted or saved without "
+                        "a file extension."
+                    )
+                    logger.warning(msg)
             workspace.mkdir(app)
-        return ret
-
-
-async def _adelete_objs(
-    workspace: Workspace, server: PuakmaServer, objs: list[DesignObject]
-) -> int:
-    async with server as s:
-        await s.server_designer.ainitiate_connection()
-        tasks = []
-        for obj in objs:
-            task = asyncio.create_task(_adelete(workspace, s.app_designer, obj))
-            tasks.append(task)
-        ret = 0
-        for done in asyncio.as_completed(tasks):
-            try:
-                ret |= await done
-            except (asyncio.CancelledError, Exception):
-                for task in tasks:
-                    task.cancel()
-                raise
-        return ret
-
-
-async def _adelete(
-    workspace: Workspace,
-    app_designer: AppDesigner,
-    obj: DesignObject,
-) -> int:
-    await obj.adelete(app_designer)
-    obj.app.design_objects.remove(obj)
-    path = obj.design_path(workspace).path
-    try:
-        path.unlink()
-        logger.info(f"Deleted Local File: {path}")
-    except FileNotFoundError as e:
-        err = (
-            f"Unable to delete local file because it does not exist: {path}\n"
-            "It may have already been deleted or saved without file extension."
-        )
-        logger.warning(f"{e}: {err}")
-    return 0
+        return 0

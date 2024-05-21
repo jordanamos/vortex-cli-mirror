@@ -63,13 +63,12 @@ def list_(
 
 
 def _render_db_connections(apps: list[PuakmaApplication]) -> None:
-    row_headers = ["Application", "ID", "Name"]
-
+    row_headers = ["ID", "Connection Name", "Application"]
     row_data = []
     for app in sorted(apps, key=lambda x: (x.group.casefold(), x.name.casefold())):
         if app.db_connections:
             for conn in app.db_connections:
-                row = (str(app), conn.id, conn.name)
+                row = (conn.id, conn.name, str(app))
                 row_data.append(row)
     print(tabulate.tabulate(row_data, headers=row_headers))
 

@@ -71,13 +71,12 @@ class LoggingHandler(logging.Handler):
     @classmethod
     def log_to_file_and_exit(cls, exc: Exception, ret_code: int) -> NoReturn:
         with contextlib.ExitStack() as ctx:
-            if cls.workspace is not None:
+            if cls.workspace is not None and sys.stdout.isatty():
                 cls.workspace.logs_dir.mkdir(exist_ok=True)
                 log_file_path = cls.workspace.logs_dir / "vortex.log"
                 cls._output_msg(f"Check the log at {log_file_path}")
                 log: IO[bytes] = ctx.enter_context(open(log_file_path, "wb"))
             else:
-                cls._output_msg("Failed to write to log file. No Workspace set.")
                 log = sys.stdout.buffer
 
             error_msg = f"{type(exc).__name__}:\n{exc}"

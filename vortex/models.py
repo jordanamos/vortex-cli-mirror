@@ -125,6 +125,7 @@ class DatabaseConnection(NamedTuple):
 class PuakmaServer:
     def __init__(
         self,
+        name: str,
         host: str,
         port: int,
         soap_path: str,
@@ -133,14 +134,20 @@ class PuakmaServer:
         username: str | None = None,
         password: str | None = None,
     ) -> None:
+        self.name = name
         self._host = host
         self._port = port
         self.soap_path = soap_path
         self.webdesign_path = webdesign_path
         self.puakma_db_conn_id = puakma_db_conn_id
-        self.username = username or input("Enter your Username: ")
-        self.password = password or getpass.getpass("Enter your Password: ")
-
+        self.username = (
+            username or os.getenv("VORTEX_USERNAME") or input("Enter your Username: ")
+        )
+        self.password = (
+            password
+            or os.getenv("VORTEX_PASSWORD")
+            or getpass.getpass("Enter your Password: ")
+        )
         self._aclient = httpx.AsyncClient(auth=self.auth)
         self._client = httpx.Client(auth=self.auth)
         self.app_designer = AppDesigner(self)
@@ -272,14 +279,20 @@ class PuakmaServer:
         logs: list[LogItem] = []
         for log in resp:
             id_ = int(log["id"])
-            date = datetime.strptime(log["date"], log_date_format)
+
+            try:
+                date = datetime.strptime(log["date"], log_date_format)
+            except ValueError:
+                # try No ms
+                date = datetime.strptime(log["date"], "%Y-%m-%d %H:%M:%S")
+
             log_ = LogItem(id_, log["msg"], date, log["type"], log["src"], log["user"])
             logs.append(log_)
         return logs
 
 
 class PuakmaApplication:
-    PICKLE_FILE = ".PuakmaApplication.pickle"
+    MANIFEST_FILE = ".pma"
 
     def __init__(
         self,
@@ -314,8 +327,9 @@ class PuakmaApplication:
         return hash((self.host, self.id))
 
     @property
-    def dir_name(self) -> str:
-        return f"{self.host}_{self.group}_{self.name}"
+    def path(self) -> Path:
+        # the 'puakma' application doesn't have a group
+        return Path(self.host, self.group or "_", self.name)
 
     @property
     def url(self) -> str:
@@ -333,7 +347,7 @@ class PuakmaApplication:
         within the given directory.
         Raises ValueError if unsuccessful
         """
-        app_file = path / cls.PICKLE_FILE
+        app_file = path / cls.MANIFEST_FILE
         try:
             with open(app_file, "rb") as f:
                 app = pickle.load(f)
@@ -348,22 +362,39 @@ class PuakmaApplication:
     async def afetch_design_objects(
         server: PuakmaServer, app_id: int, get_resources: bool = False
     ) -> list[dict[str, Any]]:
-        resources_where = (
-            "" if get_resources else f" AND designtype <> {DesignType.RESOURCE.value}"
-        )
+        resources_where = ""
+        if not get_resources:
+            resources_where = (
+                f" AND (designtype <> {DesignType.RESOURCE.value}"
+                " OR contenttype = 'application/java-archive')"
+            )
+
         query = f"{_DESIGN_OBJECT_QUERY}{resources_where}" % app_id
         logger.debug(f"Fetching Design Objects [{app_id}]...")
         return await server.database_designer.aexecute_query(
             server.puakma_db_conn_id, query
         )
 
-    def lookup_design_obj(self, design_name: str) -> tuple[int, DesignObject]:
+    def lookup_design_obj(
+        self, design_name: str | None = None, *, design_obj_id: int | None = None
+    ) -> tuple[int, DesignObject]:
         """Returns (index, obj) for the first match in the design_objects list."""
+        if not design_name and not design_obj_id:
+            raise ValueError(
+                f"Argument design_name ({design_name}) and "
+                f"design_obj_id ({design_obj_id}) can't both be None."
+            )
+
         matches = [
             (i, obj)
             for i, obj in enumerate(self.design_objects)
-            if obj.name == design_name and obj.is_valid
+            if obj.is_valid
+            and (
+                (design_name and obj.name == design_name)
+                or (design_obj_id is not None and design_obj_id == obj.id)
+            )
         ]
+
         if len(matches) > 1:
             _objs = ", ".join(str(obj[1]) for obj in matches)
             raise DesignObjectAmbiguousError(
@@ -374,6 +405,11 @@ class PuakmaApplication:
                 f"No match found for design name '{design_name}'"
             )
         return matches.pop()
+
+
+class DesignObjectParam(NamedTuple):
+    name: str
+    value: str
 
 
 @dataclass(slots=True)
@@ -391,13 +427,22 @@ class DesignObject:
     inherit_from: str | None = field(repr=False, default=None)
     is_valid: bool = field(repr=False, default=True)
     # Params
-    parent_page: str | None = field(repr=False, default=None)
-    open_action: str | None = field(repr=False, default=None)
-    save_action: str | None = field(repr=False, default=None)
+    params: list[DesignObjectParam] = field(repr=False, default_factory=list)
 
     def __post_init__(self) -> None:
         if self.design_type == DesignType.ERROR:
             self.is_valid = False
+
+    def __str__(self) -> str:
+        return f"'{self.name}' [{self.id}]"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, DesignObject):
+            return NotImplemented
+        return self.app.host == other.app.host and self.id == other.id
+
+    def __hash__(self) -> int:
+        return hash((self.app.host, self.id))
 
     @property
     def design_type(self) -> DesignType:
@@ -408,6 +453,18 @@ class DesignObject:
         if value == DesignType.ERROR:
             self.is_valid = False
         return self._design_type
+
+    @property
+    def open_action(self) -> str | None:
+        return self.get_parameter_value("OpenAction")
+
+    @property
+    def save_action(self) -> str | None:
+        return self.get_parameter_value("SaveAction")
+
+    @property
+    def parent_page(self) -> str | None:
+        return self.get_parameter_value("ParentPage")
 
     @property
     def design_data(self) -> bytes:
@@ -427,8 +484,8 @@ class DesignObject:
 
     @property
     def file_ext(self) -> str | None:
-        ext = mimetypes.guess_extension(self.content_type)
-        if self.content_type in _JAVA_MIME_TYPES:
+        ext = mimetypes.guess_extension(self.content_type.strip())
+        if self.content_type.strip() in _JAVA_MIME_TYPES:
             ext = ".java"
         return ext
 
@@ -451,10 +508,25 @@ class DesignObject:
             self.design_type.is_java_type and not self.is_jar_library
         ) or self.design_type == DesignType.DOCUMENTATION
 
+    def get_parameter_value(self, param_name: str) -> str | None:
+        for param in self.params:
+            if param.name.casefold() == param_name.casefold():
+                return param.value
+        return None
+
+    def update_or_append_param(self, new_param: DesignObjectParam) -> None:
+        for i, param in enumerate(self.params):
+            if param.name.casefold() == new_param.name.casefold():
+                # Update the value if the name exists
+                self.params[i] = param._replace(value=new_param.value)
+                break
+        else:
+            self.params.append(new_param)
+
     def design_path(self, workspace: Workspace) -> DesignPath:
         return DesignPath(
             workspace,
-            workspace.path / self.app.dir_name / self.design_dir / self.file_name,
+            workspace.path / self.app.path / self.design_dir / self.file_name,
         )
 
     async def aupload(
@@ -468,7 +540,7 @@ class DesignObject:
         logger.log(lvl, msg)
         return ok
 
-    async def acreate(self, app_designer: AppDesigner) -> bool:
+    async def acreate_or_update(self, app_designer: AppDesigner) -> bool:
         do_create = self.id < 0
         ret_id = await app_designer.aupdate_design_object(self)
         ok = ret_id > 0
@@ -481,27 +553,11 @@ class DesignObject:
 
     async def acreate_params(self, app_designer: AppDesigner) -> None:
         tasks = []
-        if self.parent_page:
+        for param in self.params:
             tasks.append(
                 asyncio.create_task(
                     app_designer.aadd_design_object_param(
-                        self.id, "ParentPage", self.parent_page
-                    )
-                )
-            )
-        if self.open_action:
-            tasks.append(
-                asyncio.create_task(
-                    app_designer.aadd_design_object_param(
-                        self.id, "OpenAction", self.open_action
-                    )
-                )
-            )
-        if self.save_action:
-            tasks.append(
-                asyncio.create_task(
-                    app_designer.aadd_design_object_param(
-                        self.id, "SaveAction", self.save_action
+                        self.id, param.name, param.value
                     )
                 )
             )
@@ -520,9 +576,6 @@ class DesignObject:
         with open(design_path, "wb") as f:
             f.write(data_bytes)
 
-    def __str__(self) -> str:
-        return f"'{self.name}' [{self.id}]"
-
 
 class DesignType(IntEnum):
     ERROR = 0
@@ -537,6 +590,10 @@ class DesignType(IntEnum):
     @property
     def is_java_type(self) -> bool:
         return self in self.java_types()
+
+    @classmethod
+    def dirs(cls) -> list[str]:
+        return [dt.name for dt in cls if dt > 0]
 
     def source_template(self, name: str) -> bytes:
         ret = (_ACTION_TEMPLATE % name) if self.is_java_type else ""
@@ -579,25 +636,32 @@ class InvalidDesignPathError(Exception):
 class DesignPath:
     """
     Represents a path to a Design Object. Expects format:
-    /path/to/workspace/app_dir/design_dir/.../obj
+    /path/to/workspace/server/group/app_dir/design_dir/.../obj
     otherwise a InvalidDesignPathError is raised
     """
 
-    def __init__(self, workspace: Workspace, path: Path) -> None:
+    def __init__(
+        self, workspace: Workspace, path: Path, *, must_exist: bool = False
+    ) -> None:
         try:
             rel_path = path.relative_to(workspace.path)
-            app_dir, design_dir, _rem = str(rel_path).split(os.path.sep, maxsplit=2)
-            app_path = workspace.path / app_dir
-            self.app = PuakmaApplication.from_dir(app_path)
+            server_dir, group_dir, app_dir, design_dir, _rem = str(rel_path).split(
+                os.path.sep, maxsplit=4
+            )
+            app_dir_path = workspace.path / server_dir / group_dir / app_dir
+            self.app = PuakmaApplication.from_dir(app_dir_path)
+            if must_exist and not path.exists():
+                raise ValueError(f"Design Object '{path}' does not exist")
         except ValueError as e:
             raise InvalidDesignPathError(f"Invalid path to Design Object '{path}': {e}")
 
         self.workspace = workspace
         self.path = path
-        self.app_dir_path = app_path
+        self.app_dir_path = app_dir_path
         self.design_dir = design_dir
         self.fname = path.name
         self.design_name, self.ext = os.path.splitext(self.fname)
+        self.server_path = f"{self.app.group}/{self.app.name}.pma/{self.design_name}"
 
     def __str__(self) -> str:
         return str(self.path)

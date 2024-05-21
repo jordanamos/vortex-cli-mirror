@@ -47,123 +47,36 @@ While it is possible to use without it, this software has been purposefully desi
    soap_path = system/SOAPDesigner.pma
    default = server1 ; Useful when you have multiple definitions
 
+
    [server1] ; This can be called whatever you want and can be referenced using the '--server' flag
    host = example.com
    port = 8080 ; we can overwrite the DEFAULT value
    puakma_db_conn_id = 13
    username = myuser ; Optional - Prompted at runtime if not provided
    password = mypassword ; Optional - Prompted at runtime if not provided
-   ```
-
-4. Setup the [Visual Studio Code Workspace](https://code.visualstudio.com/docs/editor/workspaces) to use the same Java version as your server in /path/to/workspace/.vscode/vortex.code-workspace under "settings", for example:
-   ```
-   "java.configuration.runtimes": [
-      {
-         "default": true,
-         "name": "JavaSE-1.8",
-         "path": "/Library/Java/JavaVirtualMachines/temurin-8.jdk/Contents/Home"
-      }
-   ]
+   lib_path = ; additional jars that should be included in the classpath
+   java_home = /usr/lib/jvm/java-17-openjdk-amd64/ ; The local path to the JRE to use. Should be the same version running on your server
+   java_environment_name = JavaSE-17 ; Java Execution Environment name https://docs.osgi.org/reference/eenames.html
    ```
 
 ## Usage
 
 For a full list of commands see `--help`.
 
-<br/>
+### Command Overview
 
-### List Puakma Applications
-
-To list the Puakma Applications available on the server, use the `list` command:
-
-```
-vortex list
-```
-
-This will display a table showing the ID, name, template, and inheritance of each Puakma Application.
-
-### Clone a Puakma Application
-
-To clone a Puakma Application to the local workspace, use the `clone` command:
-
-```
-vortex clone [<APP_ID>, ...]
-```
-
-Replace `<APP_ID>` with the ID(s) of the Puakma Application(s) you want to clone. The tool will clone the application(s) into the local workspace.
-
-### Open the workspace in Visual Studio Code
-
-To open the Vortex CLI workspace in Visual Studio Code, use the `code` command:
-
-```
-vortex code
-```
-
-### Watch the workspace for changes
-
-To watch the workspace containing cloned Puakma Applications and automatically upload changes to the server, use the `watch` command:
-
-```
-vortex watch
-```
-
-This will start watching the workspace for changes. As you make changes to the files in the directory, the tool will automatically upload the changes to the server.
-
-### Delete locally cloned Puakma Applications
-
-To delete the locally cloned Puakma Application directories in the workspace, use the `clean` command:
-
-```
-vortex clean
-```
-
-### Create Design Objects
-
-To create new design objects, use the `new` command:
-
-```
-vortex new [NAME, ...] --app-id <app_id> --type <design_type>
-```
-
-Specify more than one name to create multiple design objects of the same type for the specified application
-
-### Delete Design Objects
-
-To delete a design object, use the `delete` command:
-
-```
-vortex delete [DESIGN_OBJECT_ID, ...]
-```
-
-### Find cloned Design Objects
-
-To search for Design Objects by name use the `find` command:
-
-```
-vortex find <name> [options]
-```
-
-### Search the contents of cloned Design Objects
-
-To search for text patterns in Design Objects using a [Regular Expression](https://learn.microsoft.com/en-us/dotnet/standard/base-types/regular-expression-language-quick-reference) use the `grep` command:
-
-```
-vortex grep <pattern> [options]
-```
-
-### Copy Design Objects from one application to another
-
-To copy Design Objects from one application to another (You can specify many --app-ids to copy to multiple applications) use the `copy` command:
-
-```
-vortex copy DESIGN_OBJECT_ID --app-id [APP_ID ...]
-```
-
-### View the server logs
-
-To view the last _n_ log items in the server log use the `log` command:
-
-```
-vortex log [-n LIMIT]
-```
+- `code`: Open the workspace in Visual Studio Code.
+- `list` (or `ls`): List Puakma Applications on the server or cloned locally. (`ls` is an alias for `vortex list --local`)
+- `clone`: Clone Puakma Applications and their design objects into the workspace or in the .pmx format.
+- `watch`: Watch the workspace for changes to Design Objects and automatically upload them to the server.
+- `clean`: Delete the locally cloned Puakma Application directories in the workspace.
+- `config`: View and manage configuration.
+- `log`: View the server log.
+- `find`: Find Design Objects of cloned applications by name.
+- `grep`: Search the contents of cloned Design Objects using a Regular Expression.
+- `new`: Create new Design Objects, Applications, or Keywords. Use --update <ID> to update instead.
+- `copy`: Copy a Design Object from one application to another.
+- `delete`: Delete Design Objects by ID.
+- `db`: Interact with Database Connections.
+- `docs`: Open the Tornado Server Blackbook.
+- `execute`: Execute a command on the server.

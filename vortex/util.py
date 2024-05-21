@@ -142,16 +142,22 @@ def render_objects(
     row_headers = ["ID", "Name", "Type", "Application"]
     row_data = []
     if show_params:
-        row_headers.append("Parent Page")
+        row_headers.append("Content Type")
         row_headers.append("Open Action")
         row_headers.append("Save Action")
+        row_headers.append("Parent Page")
+        row_headers.append("Inherit From")
+        row_headers.append("Comment")
 
-    for obj in sorted(objs, key=lambda obj: obj.name):
+    for obj in sorted(objs, key=lambda obj: obj.name.casefold()):
         row = [obj.id, obj.name, obj.design_type.name, str(obj.app)]
         if show_params:
-            row.append(obj.parent_page or "")
+            row.append(obj.content_type or "")
             row.append(obj.open_action or "")
             row.append(obj.save_action or "")
+            row.append(obj.parent_page or "")
+            row.append(obj.inherit_from or "")
+            row.append(obj.comment or "")
         row_data.append(row)
 
     print(tabulate.tabulate(row_data, headers=row_headers))

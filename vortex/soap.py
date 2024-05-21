@@ -33,13 +33,16 @@ _XSI_NULL: Literal["xsi:null"] = "xsi:null"
 class _SOAPParam(NamedTuple):
     name: str
     value: Any
-    xsi_type: Literal[
-        "xsd:integer",
-        "xsd:string",
-        "xsd:boolean",
-        "xsd:base64Binary",
-        "xsd:int",
-    ] | None = None
+    xsi_type: (
+        Literal[
+            "xsd:integer",
+            "xsd:string",
+            "xsd:boolean",
+            "xsd:base64Binary",
+            "xsd:int",
+        ]
+        | None
+    ) = None
     array_type: Literal["xsd:string"] | None = None
 
 
@@ -179,13 +182,12 @@ class _PuakmaSOAPService(ABC):
         operation: str,
         params: list[_SOAPParam] | None = None,
         *,
-        timeout: int = 20,
+        timeout: int = 20,  # noqa: ASYNC109
     ) -> ET.Element:
         """
         Builds and sends a SOAP envelope to the service endpoint and returns the parsed
         response element. Raises HTTPStatusError if one occurred
         """
-
         envelope = self._build_envelope(operation, params)
         async with self._sem:
             resp = await self.server._aclient.post(
@@ -282,11 +284,7 @@ class AppDesigner(_PuakmaSOAPService):
     async def aadd_design_object_param(
         self,
         design_object_id: int,
-        param_name: Literal[
-            "OpenAction",
-            "SaveAction",
-            "ParentPage",
-        ],
+        param_name: str,
         param_value: str,
     ) -> None:
         operation = "addDesignObjectParam"
@@ -294,6 +292,16 @@ class AppDesigner(_PuakmaSOAPService):
             _SOAPParam("p1", design_object_id, _XSD_INTEGER),
             _SOAPParam("p2", param_name, _XSD_STRING),
             _SOAPParam("p3", param_value, _XSD_STRING),
+        ]
+        await self._apost(operation, params)
+
+    async def aclear_design_object_params(
+        self,
+        design_object_id: int,
+    ) -> None:
+        operation = "clearDesignObjectParams"
+        params = [
+            _SOAPParam("p1", design_object_id, _XSD_INTEGER),
         ]
         await self._apost(operation, params)
 
@@ -338,9 +346,9 @@ class DatabaseDesigner(_PuakmaSOAPService):
         for row in resp.findall(".//row"):
             ret.append(
                 {
-                    col_lookup[int(col.attrib["index"]) - 1]: col.text
-                    if col.text
-                    else ""
+                    col_lookup[int(col.attrib["index"]) - 1]: (
+                        col.text if col.text else ""
+                    )
                     for col in row
                 }
             )
@@ -395,6 +403,7 @@ class DownloadDesigner(_PuakmaSOAPService):
         self,
         app_id: int,
         include_source: bool = False,
+        timeout: int = 100,  # noqa: ASYNC109
     ) -> bytes:
         """Returns bytes xml"""
         operation = "downloadPmx"
@@ -403,9 +412,9 @@ class DownloadDesigner(_PuakmaSOAPService):
             _SOAPParam("p2", include_source, _XSD_BOOLEAN),
         ]
         # This operation takes a while for big applications, set timeout to 100
-        resp = await self._apost(operation, params, timeout=100)
+        resp = await self._apost(operation, params, timeout=timeout)
         if resp.text is not None:
-            return base64.b64decode(resp.text)
+            return base64.b64decode(resp.text, validate=True)
         else:
             return b""
 
